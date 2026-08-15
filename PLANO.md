@@ -109,8 +109,8 @@ scroll).
 
 - [x] `nebula/src/volume.rs`: `Volume3D` — cria a textura 3D (`R32Float`), faz upload via
       `queue.write_texture` e monta o bind group (textura + sampler)
-- [x] Detecção de suporte a `FLOAT32_FILTERABLE` no adapter, com fallback pra sampling
-      `Nearest` quando a feature não está disponível
+- [x] Sampling sempre `Nearest` (ver nota abaixo — sampling linear de `R32Float` mostrou um
+      bug visual real, não só uma questão de suporte do adapter)
 - [x] `Renderer::load_volume(width, height, depth, data)` — recebe o volume do lado Python via
       `pyo3::buffer::PyBuffer<f32>` (protocolo de buffer do numpy, sem depender da crate
       `numpy`/rust-numpy — evita mais uma dependência bleeding-edge pra rastrear)
@@ -121,8 +121,19 @@ scroll).
       gradiente + xadrez 3D gerado com numpy, sem dependência de dados reais ainda
 
 **Critério de saída**: padrão sintético gerado em Python aparece corretamente na fatia
-renderizada. Build e import do módulo verificados; teste visual interativo (abrir a janela e
-orbitar) fica por conta do usuário nesta rodada.
+renderizada — confirmado visualmente (usuário testou orbit/pan/zoom e viu o xadrez).
+
+**Bug real encontrado e corrigido**: a primeira versão usava sampling `Linear` quando o
+adapter suportava `FLOAT32_FILTERABLE`, e o resultado renderizado era um gradiente liso sem
+nenhum traço do xadrez — não um blur sutil nas bordas dos blocos, o padrão inteiro sumia.
+Isolei a causa comparando `textureSample` (sampler) com `textureLoad` (leitura direta por
+texel, sem sampler): `textureLoad` mostrava o xadrez perfeito, provando que o dado chegava
+certo na textura — o problema era só no sampler linear. Não cheguei à causa raiz exata dentro
+do wgpu 30 (candidato mais provável: alguma interação de LOD/mip clamp com o ângulo de visão
+bem inclinado da câmera orbital, já que só há 1 nível de mip), mas em vez de investigar mais
+fundo numa API tão recente, simplifiquei: sampling de volume agora é sempre `Nearest`,
+independente do adapter. Faz sentido além de contornar o bug — amplitude sísmica amostrada não
+deveria ser interpolada silenciosamente entre vizinhos de qualquer forma.
 
 **Fora de escopo desta fase** (fica pras seguintes): leitura de HDF5 real (isso continua sendo
 trabalho do lado Python/Andromeda), múltiplas fatias ortogonais simultâneas, ray marching e
