@@ -25,8 +25,13 @@ impl OrbitCamera {
         Self {
             target: Vec3::ZERO,
             distance: 4.0,
-            azimuth: std::f32::consts::FRAC_PI_4,
-            elevation: std::f32::consts::FRAC_PI_6,
+            // Azimute/elevação 0 = olhando reto pro eixo Z do mundo, que é
+            // exatamente a direção perpendicular ao quad de seção sísmica
+            // (fatiado na crossline do meio). Os 45°/30° de antes eram bons
+            // pra mostrar o cubo genérico da Fase 2, mas deixavam a seção
+            // sísmica com cara de trapézio, vista de esguelha por padrão.
+            azimuth: 0.0,
+            elevation: 0.0,
             fovy_radians: std::f32::consts::FRAC_PI_4,
             aspect,
             znear: 0.1,

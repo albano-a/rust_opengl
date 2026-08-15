@@ -1,4 +1,5 @@
 mod camera;
+mod colormap;
 mod geometry;
 mod volume;
 
@@ -12,6 +13,7 @@ use pyo3::prelude::*;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle};
 
 use camera::OrbitCamera;
+use colormap::Colormap;
 use geometry::{SliceVertex, SLICE_INDICES, SLICE_VERTICES};
 use volume::Volume3D;
 
@@ -73,6 +75,10 @@ struct Renderer {
     volume_bind_group_layout: wgpu::BindGroupLayout,
     volume_filterable: bool,
     volume: Option<Volume3D>,
+
+    colormap_bind_group_layout: wgpu::BindGroupLayout,
+    colormap: Colormap,
+    clim: (f32, f32),
 }
 
 #[pymethods]
@@ -215,6 +221,51 @@ impl Renderer {
                 ],
             });
 
+        let colormap_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("colormap_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D1,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        // Cinza simples até o Python chamar `set_colormap` com uma paleta de
+        // verdade — evita o Renderer ficar num estado "sem colormap" que
+        // precisaria de tratamento especial no render().
+        let clim = (0.0_f32, 1.0_f32);
+        let colormap = Colormap::upload(
+            &device,
+            &queue,
+            &colormap_bind_group_layout,
+            &[0, 0, 0, 255, 255, 255, 255, 255],
+            clim,
+        );
+
         let slice_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("volume_slice_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("volume_slice.wgsl").into()),
@@ -222,7 +273,11 @@ impl Renderer {
 
         let slice_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("slice_pipeline_layout"),
-            bind_group_layouts: &[Some(&scene_bind_group_layout), Some(&volume_bind_group_layout)],
+            bind_group_layouts: &[
+                Some(&scene_bind_group_layout),
+                Some(&volume_bind_group_layout),
+                Some(&colormap_bind_group_layout),
+            ],
             immediate_size: 0,
         });
 
@@ -292,6 +347,9 @@ impl Renderer {
             volume_bind_group_layout,
             volume_filterable,
             volume: None,
+            colormap_bind_group_layout,
+            colormap,
+            clim,
         })
     }
 
@@ -348,6 +406,40 @@ impl Renderer {
         ));
 
         Ok(())
+    }
+
+    /// Define a paleta de cores (colormap contínuo) usada pra mapear o valor
+    /// amostrado do volume em cor. `rgba` precisa ser um array `uint8`
+    /// C-contíguo de shape `(N, 4)` — a origem (matplotlib, ou Petrel/Paradigm
+    /// convertidos pra VisPy no Andromeda) não importa pro Nebula: o lado
+    /// Python já resolve isso e manda a paleta pronta, amostrada em N pontos.
+    fn set_colormap(&mut self, rgba: PyBuffer<u8>) -> PyResult<()> {
+        if rgba.item_count() % 4 != 0 {
+            return Err(PyRuntimeError::new_err(
+                "rgba precisa ter um múltiplo de 4 elementos (N cores RGBA)",
+            ));
+        }
+
+        let bytes = Python::attach(|py| rgba.to_vec(py))
+            .map_err(|e| PyRuntimeError::new_err(format!("falha ao ler o buffer: {e}")))?;
+
+        self.colormap = Colormap::upload(
+            &self.device,
+            &self.queue,
+            &self.colormap_bind_group_layout,
+            &bytes,
+            self.clim,
+        );
+
+        Ok(())
+    }
+
+    /// Ajusta a faixa de valores (`clim`) mapeada pros extremos do colormap —
+    /// equivalente ao `clim=(min, max)` do Andromeda. Não recria a textura do
+    /// colormap, só reescreve o uniform.
+    fn set_clim(&mut self, min: f32, max: f32) {
+        self.clim = (min, max);
+        self.colormap.set_clim(&self.queue, self.clim);
     }
 
     fn render(&mut self) -> PyResult<()> {
@@ -429,6 +521,7 @@ impl Renderer {
                 render_pass.set_pipeline(&self.slice_pipeline);
                 render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
                 render_pass.set_bind_group(1, &volume.bind_group, &[]);
+                render_pass.set_bind_group(2, &self.colormap.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, self.slice_vertex_buffer.slice(..));
                 render_pass
                     .set_index_buffer(self.slice_index_buffer.slice(..), wgpu::IndexFormat::Uint16);

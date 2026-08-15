@@ -14,6 +14,13 @@ var volume_texture: texture_3d<f32>;
 @group(1) @binding(1)
 var volume_sampler: sampler;
 
+@group(2) @binding(0)
+var colormap_texture: texture_1d<f32>;
+@group(2) @binding(1)
+var colormap_sampler: sampler;
+@group(2) @binding(2)
+var<uniform> clim: vec4<f32>; // x = min, y = max; zw não usados (padding)
+
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) uv: vec2<f32>,
@@ -45,9 +52,19 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    // Fase 3: sempre a fatia do meio (w = 0.5). Amostrar um w escolhido pelo
-    // usuário é trabalho da Fase 4/5 (equivalente ao AxisAlignedImage do VisPy).
-    let albedo = textureSample(volume_texture, volume_sampler, vec3<f32>(input.uv, 0.5)).r;
+    // Fase 3: sempre uma seção vertical fixa na crossline do meio (v = 0.5) —
+    // eixo X do quad = inline, eixo Y do quad = profundidade/tempo. É essa
+    // orientação (não uma fatia horizontal de tempo) que dá a cara clássica de
+    // seção sísmica. Deixar o usuário escolher qual eixo fatiar é Fase 4/5
+    // (equivalente ao AxisAlignedImage do VisPy).
+    let raw_value =
+        textureSample(volume_texture, volume_sampler, vec3<f32>(input.uv.x, 0.5, input.uv.y)).r;
+
+    // Normaliza pelo clim (igual o `clim=(min,max)` do Andromeda) antes de
+    // indexar a LUT — os dois extremos do colormap ficam nos limites do dado,
+    // não em 0..1 fixo.
+    let t = clamp((raw_value - clim.x) / max(clim.y - clim.x, 1e-6), 0.0, 1.0);
+    let albedo = textureSample(colormap_texture, colormap_sampler, t).rgb;
 
     var normal = normalize(input.world_normal);
     let view_dir = normalize(scene.camera_position.xyz - input.world_position);
@@ -68,5 +85,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let diffuse = max(dot(normal, light_dir), 0.0);
 
     let lit = albedo * (ambient + diffuse);
-    return vec4<f32>(lit, lit, lit, 1.0);
+    return vec4<f32>(lit, 1.0);
 }

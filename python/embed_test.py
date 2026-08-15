@@ -19,6 +19,7 @@ Rodar de dentro de nebula/.venv (com `nebula` instalado via `maturin develop`):
 import sys
 import time
 
+import matplotlib
 import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QWindow
@@ -36,15 +37,117 @@ from PyQt5.QtWidgets import (
 
 import nebula
 
+# Troque aqui pra testar outro colormap contínuo do matplotlib (ex: "jet",
+# "gray_r", "seismic", "gist_rainbow_r" — os mesmos nomes já usados hoje no
+# Andromeda). Qualquer colormap "contínuo" do matplotlib funciona; LUTs
+# categóricas (ex: facies) são um caso à parte, resolvido no lado VisPy do
+# LogPlot Vision, não aqui.
+COLORMAP_NAME = "viridis"
 
-def build_synthetic_volume(width=64, height=64, depth=64):
-    """Volume escalar sintético (gradiente + xadrez 3D) só pra provar o caminho
-    de upload Python -> textura 3D — sem ligação com dados sísmicos reais ainda.
+# "seismic": refletores sintéticos (parece sísmica de verdade).
+# "checker": mostra a variação de cor do colormap (útil pra validar a paleta).
+# "constant": cinza uniforme, útil pra isolar e testar só a iluminação.
+VOLUME_PATTERN = "seismic"
+
+
+def build_colormap_lut(name: str, resolution: int = 256) -> np.ndarray:
+    """Amostra um colormap do matplotlib em `resolution` pontos e devolve um
+    array `uint8` `(resolution, 4)` RGBA — o formato que `Renderer.set_colormap`
+    espera.
+
+    O Nebula não sabe nada sobre matplotlib/VisPy: só recebe essa tabela já
+    pronta. No Andromeda, os colormaps do Petrel/Paradigm já viram objetos
+    `vispy.color.Colormap`, que também têm um jeito de amostrar em N pontos
+    (`cmap.map(...)`) — o mesmo padrão se aplicaria trocando só essa função.
+    """
+    cmap = matplotlib.colormaps[name]
+    samples = cmap(np.linspace(0.0, 1.0, resolution))  # (resolution, 4) float 0..1
+    return np.ascontiguousarray(samples * 255.0, dtype=np.uint8)
+
+
+def _ricker_wavelet(length: int, freq: float) -> np.ndarray:
+    """Wavelet de Ricker ("chapéu mexicano") — a mesma forma de onda usada em
+    modelagem sísmica sintética de verdade pra convolver com a refletividade."""
+    t = np.arange(length) - length // 2
+    a = (np.pi * freq * t) ** 2
+    return ((1.0 - 2.0 * a) * np.exp(-a)).astype(np.float32)
+
+
+def build_seismic_volume(width=64, height=64, depth=64, n_reflectors=6, seed=7):
+    """Sísmica sintética de verdade: refletores em camadas (com mergulho e
+    dobra suaves, diferentes por camada) convolvidos com uma wavelet Ricker ao
+    longo do eixo de profundidade — o mesmo princípio (refletividade × wavelet)
+    usado em modelagem sísmica convolucional real, só que sem física de
+    propagação de onda por trás.
+    """
+    rng = np.random.default_rng(seed)
+
+    y_idx, x_idx = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+    xn = x_idx / max(width - 1, 1)
+    yn = y_idx / max(height - 1, 1)
+
+    reflectivity = np.zeros((depth, height, width), dtype=np.float32)
+
+    base_positions = np.sort(rng.uniform(0.15, 0.85, n_reflectors))
+    strengths = rng.uniform(-1.0, 1.0, n_reflectors)
+
+    for pos, strength in zip(base_positions, strengths):
+        # Mergulho (plano inclinado) + dobra (senoide) — cada refletor com sua
+        # própria variação, pra parecer camadas geológicas de verdade, não
+        # planos paralelos perfeitos.
+        dip_x = rng.uniform(-0.06, 0.06)
+        dip_y = rng.uniform(-0.04, 0.04)
+        fold_amp = rng.uniform(0.01, 0.04)
+        fold_freq = rng.uniform(1.0, 2.5)
+        fold_phase = rng.uniform(0.0, 2 * np.pi)
+
+        undulation = (
+            dip_x * (xn - 0.5)
+            + dip_y * (yn - 0.5)
+            + fold_amp * np.sin(2 * np.pi * fold_freq * xn + fold_phase)
+        )
+        depth_idx = np.clip(
+            np.round((pos + undulation) * (depth - 1)).astype(np.int32), 0, depth - 1
+        )
+        np.add.at(reflectivity, (depth_idx, y_idx, x_idx), strength)
+
+    # Convolve cada traço (eixo Z) com a wavelet — é isso que transforma os
+    # "espinhos" de refletividade nas ondulações típicas de seção sísmica.
+    wavelet = _ricker_wavelet(length=15, freq=0.12)
+    volume = np.apply_along_axis(
+        lambda trace: np.convolve(trace, wavelet, mode="same"), axis=0, arr=reflectivity
+    )
+
+    volume -= volume.min()
+    max_value = volume.max()
+    if max_value > 1e-9:
+        volume /= max_value
+    return np.ascontiguousarray(volume, dtype=np.float32)
+
+
+def build_synthetic_volume(width=64, height=64, depth=64, pattern="constant"):
+    """Volume escalar sintético só pra provar o caminho de upload Python ->
+    textura 3D — sem ligação com dados sísmicos reais ainda.
+
+    `pattern="constant"`: cinza uniforme (albedo = 0.7 em todo canto), útil pra
+    testar iluminação isoladamente — sem xadrez/gradiente competindo
+    visualmente com a sombra.
+    `pattern="checker"`: gradiente + xadrez 3D, útil pra validar que o upload
+    da textura preserva a estrutura espacial certa (foi o teste da Fase 3).
+    `pattern="seismic"`: refletores em camadas convolvidos com wavelet Ricker
+    (`build_seismic_volume`) — parece sísmica de verdade, bom pra validar
+    colormap + iluminação juntos.
 
     Layout: array numpy C-contíguo de shape (depth, height, width), que é
     exatamente a ordem de bytes que `Renderer.load_volume` espera (x/width é o
     eixo que varia mais rápido na memória).
     """
+    if pattern == "constant":
+        return np.full((depth, height, width), 0.7, dtype=np.float32)
+
+    if pattern == "seismic":
+        return build_seismic_volume(width, height, depth)
+
     x = np.linspace(0.0, 1.0, width, dtype=np.float32)
     y = np.linspace(0.0, 1.0, height, dtype=np.float32)
     z = np.linspace(0.0, 1.0, depth, dtype=np.float32)
@@ -92,12 +195,20 @@ class NebulaWindow(QWindow):
         self._drag_button = None
         self._last_pos = None
         self._pending_volume = None
+        self._pending_colormap = None
+        self._pending_clim = None
 
     def set_volume(self, width: int, height: int, depth: int, data: np.ndarray):
         # O Renderer só existe depois do primeiro resize real (winId() só é
         # válido depois que a QWindow tem uma janela nativa por trás). Guardamos
         # o volume e mandamos pro Rust assim que o Renderer estiver pronto.
         self._pending_volume = (width, height, depth, data)
+
+    def set_colormap(self, rgba: np.ndarray):
+        self._pending_colormap = rgba
+
+    def set_clim(self, min_value: float, max_value: float):
+        self._pending_clim = (min_value, max_value)
 
     def shutdown(self):
         # Chamado antes do Qt começar a destruir a janela nativa: depois disso,
@@ -128,6 +239,14 @@ class NebulaWindow(QWindow):
             width, height, depth, data = self._pending_volume
             renderer.load_volume(width, height, depth, data)
             self._pending_volume = None
+
+        if self._pending_colormap is not None:
+            renderer.set_colormap(self._pending_colormap)
+            self._pending_colormap = None
+
+        if self._pending_clim is not None:
+            renderer.set_clim(*self._pending_clim)
+            self._pending_clim = None
 
         renderer.render()
 
@@ -228,8 +347,11 @@ def main():
     main_win.setCentralWidget(container)
 
     volume_dim = 64
-    volume_data = build_synthetic_volume(volume_dim, volume_dim, volume_dim)
+    volume_data = build_synthetic_volume(volume_dim, volume_dim, volume_dim, pattern=VOLUME_PATTERN)
     render_window.set_volume(volume_dim, volume_dim, volume_dim, volume_data)
+
+    render_window.set_colormap(build_colormap_lut(COLORMAP_NAME))
+    render_window.set_clim(0.0, 1.0)  # bate com a faixa de valores do volume sintético
 
     tree_dock = QDockWidget("Object Tree", main_win)
     tree_dock.setWidget(build_object_tree())
