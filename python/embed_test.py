@@ -1,5 +1,11 @@
-"""Protótipo mínimo da Fase 1: triângulo renderizado via wgpu (módulo `nebula`),
-embutido numa QWindow do PyQt5 através de createWindowContainer.
+"""Protótipo de embedding (Fase 1) + câmera orbital (Fase 2): cubo renderizado via
+wgpu (módulo `nebula`), embutido numa QWindow do PyQt5 através de
+createWindowContainer, com câmera controlada por mouse.
+
+Controles (mesma convenção do MiddlePanTurntableCamera do VisPy no Andromeda):
+    botão esquerdo arrastando  -> orbit (gira em torno do alvo)
+    botão do meio arrastando   -> pan (translada o alvo)
+    botão direito arrastando / scroll -> zoom
 
 Inclui um dock de árvore de objetos e uma toolbar como stand-ins para os widgets reais
 que cercam o canvas 3D no Andromeda (svwObjectTreeWidget / slicesToolBar), só pra
@@ -58,6 +64,8 @@ class NebulaWindow(QWindow):
         self.setSurfaceType(QWindow.OpenGLSurface)
         self._renderer = None
         self._closed = False
+        self._drag_button = None
+        self._last_pos = None
 
     def shutdown(self):
         # Chamado antes do Qt começar a destruir a janela nativa: depois disso,
@@ -83,6 +91,38 @@ class NebulaWindow(QWindow):
         renderer = self._ensure_renderer()
         if renderer is not None:
             renderer.render()
+
+    def mousePressEvent(self, event):
+        self._drag_button = event.button()
+        self._last_pos = event.pos()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_button = None
+        self._last_pos = None
+
+    def mouseMoveEvent(self, event):
+        if self._last_pos is None:
+            return
+        renderer = self._ensure_renderer()
+        if renderer is None:
+            return
+
+        pos = event.pos()
+        dx = float(pos.x() - self._last_pos.x())
+        dy = float(pos.y() - self._last_pos.y())
+        self._last_pos = pos
+
+        if self._drag_button == Qt.LeftButton:
+            renderer.orbit(dx, dy)
+        elif self._drag_button == Qt.MiddleButton:
+            renderer.pan(dx, dy)
+        elif self._drag_button == Qt.RightButton:
+            renderer.zoom(dy)
+
+    def wheelEvent(self, event):
+        renderer = self._ensure_renderer()
+        if renderer is not None:
+            renderer.zoom(event.angleDelta().y() / 8.0)
 
 
 def build_object_tree() -> QTreeWidget:

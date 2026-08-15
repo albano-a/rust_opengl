@@ -1,21 +1,34 @@
+mod camera;
+mod geometry;
+
 use std::num::NonZeroIsize;
 
-use bytemuck::{Pod, Zeroable};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle};
 
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
-struct Vertex {
-    position: [f32; 2],
-}
+use camera::OrbitCamera;
+use geometry::{Vertex, CUBE_INDICES, CUBE_VERTICES};
 
-const VERTICES: [Vertex; 3] = [
-    Vertex { position: [0.0, 0.5] },
-    Vertex { position: [-0.5, -0.5] },
-    Vertex { position: [0.5, -0.5] },
-];
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("depth_texture"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
 
 /// Motor de renderização Nebula, embutido num HWND emprestado de um host nativo
 /// (ex: uma `QWindow` do PyQt5 via `createWindowContainer`).
@@ -30,6 +43,12 @@ struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
+    depth_view: wgpu::TextureView,
+    camera: OrbitCamera,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
 }
 
 #[pymethods]
@@ -89,6 +108,43 @@ impl Renderer {
         let surface_format = config.format;
         surface.configure(&device, &config);
 
+        let depth_view = create_depth_view(&device, &config);
+
+        let camera = OrbitCamera::new(config.width as f32 / config.height as f32);
+
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("camera_bind_group_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let camera_buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("camera_buffer"),
+                contents: bytemuck::cast_slice(&[camera.view_proj()]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            },
+        );
+
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera_bind_group"),
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -96,25 +152,17 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline_layout"),
-            bind_group_layouts: &[],
+            bind_group_layouts: &[Some(&camera_bind_group_layout)],
             immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("triangle_pipeline"),
+            label: Some("cube_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        offset: 0,
-                        shader_location: 0,
-                        format: wgpu::VertexFormat::Float32x2,
-                    }],
-                })],
+                buffers: &[Some(Vertex::layout())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -128,7 +176,13 @@ impl Renderer {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -138,8 +192,17 @@ impl Renderer {
             &device,
             &wgpu::util::BufferInitDescriptor {
                 label: Some("vertex_buffer"),
-                contents: bytemuck::cast_slice(&VERTICES),
+                contents: bytemuck::cast_slice(&CUBE_VERTICES),
                 usage: wgpu::BufferUsages::VERTEX,
+            },
+        );
+
+        let index_buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("index_buffer"),
+                contents: bytemuck::cast_slice(&CUBE_INDICES),
+                usage: wgpu::BufferUsages::INDEX,
             },
         );
 
@@ -150,6 +213,12 @@ impl Renderer {
             config,
             pipeline,
             vertex_buffer,
+            index_buffer,
+            num_indices: CUBE_INDICES.len() as u32,
+            depth_view,
+            camera,
+            camera_buffer,
+            camera_bind_group,
         })
     }
 
@@ -161,6 +230,23 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        self.depth_view = create_depth_view(&self.device, &self.config);
+        self.camera.set_aspect(width as f32 / height as f32);
+    }
+
+    /// Botão esquerdo do mouse arrastando: gira a câmera em torno do alvo.
+    fn orbit(&mut self, dx: f32, dy: f32) {
+        self.camera.orbit(dx, dy);
+    }
+
+    /// Botão do meio arrastando: translada o alvo (pan) no plano da tela.
+    fn pan(&mut self, dx: f32, dy: f32) {
+        self.camera.pan(dx, dy);
+    }
+
+    /// Botão direito arrastando (ou scroll): aproxima/afasta a câmera.
+    fn zoom(&mut self, delta: f32) {
+        self.camera.zoom(delta);
     }
 
     fn render(&mut self) -> PyResult<()> {
@@ -180,6 +266,12 @@ impl Renderer {
                 ));
             }
         };
+
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[self.camera.view_proj()]),
+        );
 
         let view = frame
             .texture
@@ -208,15 +300,24 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
 
             render_pass.set_pipeline(&self.pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.draw(0..3, 0..1);
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
