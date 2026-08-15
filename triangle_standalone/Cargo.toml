@@ -1,0 +1,11 @@
+[package]
+name = "rust_opengl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = "0.30"
+raw-window-handle = "0.6"
+wgpu = "30.0.0"
+pollster = "1.0.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
