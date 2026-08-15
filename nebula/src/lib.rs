@@ -93,18 +93,15 @@ impl Renderer {
         }))
         .map_err(|e| PyRuntimeError::new_err(format!("nenhum adapter wgpu disponível: {e}")))?;
 
-        // Nem todo adapter sabe fazer sampling linear de textura R32Float (a
-        // textura de volume). Detectamos aqui e propagamos pro Volume3D na hora
-        // de montar o sampler.
-        let volume_filterable = adapter.features().contains(wgpu::Features::FLOAT32_FILTERABLE);
-        let mut required_features = wgpu::Features::empty();
-        if volume_filterable {
-            required_features |= wgpu::Features::FLOAT32_FILTERABLE;
-        }
+        // Sampling da textura de volume é sempre "nearest": amplitude sísmica
+        // amostrada não deveria ser interpolada silenciosamente entre vizinhos,
+        // e sampling linear de R32Float depende da feature FLOAT32_FILTERABLE
+        // (nem todo adapter tem) — nearest evita as duas questões de uma vez.
+        let volume_filterable = false;
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
-            required_features,
+            required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,

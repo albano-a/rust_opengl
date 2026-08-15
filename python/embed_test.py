@@ -50,12 +50,13 @@ def build_synthetic_volume(width=64, height=64, depth=64):
     z = np.linspace(0.0, 1.0, depth, dtype=np.float32)
     zz, yy, xx = np.meshgrid(z, y, x, indexing="ij")
 
-    gradient = xx
-    checker = (
-        (xx * 8).astype(np.int32) + (yy * 8).astype(np.int32) + (zz * 8).astype(np.int32)
-    ) % 2
+    # Xadrez só em (x, y): fica idêntico em qualquer fatia Z, então nunca
+    # cancela no sampling bilinear entre duas camadas de profundidade vizinhas
+    # (o que acontecia quando Z também entrava na paridade do xadrez e a fatia
+    # amostrada caía exatamente numa borda de paridade).
+    checker_xy = ((xx * 8).astype(np.int32) + (yy * 8).astype(np.int32)) % 2
 
-    volume = 0.5 * gradient + 0.5 * checker.astype(np.float32)
+    volume = 0.35 * checker_xy.astype(np.float32) + 0.35 * xx + 0.3 * zz
     return np.ascontiguousarray(volume, dtype=np.float32)
 
 
