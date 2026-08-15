@@ -274,6 +274,13 @@ class NebulaWindow(QWindow):
         # das fatias.
         self._text_labels = {}
         self._text_labels_added = set()
+        # (width, height, depth) do grid de eixo (INLINE/CROSSLINE/TIME
+        # numerado) — o Rust é dono de tudo daqui pra baixo: cria os labels
+        # uma vez e recalcula a posição/aresta deles a cada frame conforme a
+        # câmera orbita (`Renderer.configure_axis_grid`). Mesmo padrão
+        # "pendente" das fatias/labels.
+        self._pending_axis_grid = None
+        self._axis_grid_added = False
         self.active_slice_id = None
         self.move_mode = False
         # Fatia descoberta debaixo do cursor no início de um Ctrl+arrastar
@@ -331,6 +338,17 @@ class NebulaWindow(QWindow):
         if self._renderer is None:
             return None
         return self._renderer.project_to_screen(x, y, z)
+
+    def configure_axis_grid(self, width: int, height: int, depth: int):
+        """Liga o grid numerado dos 3 eixos (INLINE/CROSSLINE/TIME) do cubo —
+        `width`/`height`/`depth` são as dimensões do volume (mesma convenção
+        de `set_volume`). O texto (nomes + valores reais de tick) e o
+        posicionamento na aresta do cubo que está de costas pra câmera são
+        inteiramente responsabilidade do Nebula (`Renderer.configure_axis_grid`),
+        recalculado a cada frame — nada aqui do lado Python precisa saber de
+        câmera ou geometria."""
+        self._pending_axis_grid = (width, height, depth)
+        self._axis_grid_added = False
 
     def add_text_label(self, label_id, x: float, y: float, z: float, text: str, color=(0.5, 0.83, 1.0), scale: float = 0.12):
         """Label de texto GPU nativo (billboard 3D, fonte bitmap embutida no
@@ -396,6 +414,10 @@ class NebulaWindow(QWindow):
                 r, g, b = color
                 renderer.add_text_label(label_id, x, y, z, text, r, g, b, scale)
                 self._text_labels_added.add(label_id)
+
+        if self._pending_axis_grid is not None and not self._axis_grid_added:
+            renderer.configure_axis_grid(*self._pending_axis_grid)
+            self._axis_grid_added = True
 
         renderer.render()
 
@@ -531,27 +553,6 @@ class ColorbarWidget(QWidget):
             (vmin, bar_rect.bottom()),
         ):
             painter.drawText(bar_rect.right() + 6, y + 4, f"{value:.2f}")
-
-
-def add_wireframe_edge_labels(render_window: "NebulaWindow", width: int, height: int, depth: int):
-    """Labels de eixo (IL/XL/Time) nos cantos do wireframe do cubo — texto GPU
-    nativo (`Renderer.add_text_label`), não mais um hack de overlay Qt por
-    cima do `createWindowContainer`. Convenção espacial (mesma do wireframe
-    em `geometry.rs`/`lib.rs`): mundo X = Inline, Y = Time (topo = raso),
-    Z = Crossline, cubo unitário -1..1. Os quatro cantos de cima levam IL/XL
-    combinados (igual o Petrel mostra "IL970/XL1650" junto no canto) e um
-    canto ganha também o Time — o outro extremo do Time fica sozinho no
-    canto de baixo correspondente.
-    """
-    anchors = [
-        (900, "IL 0\nXL 0\nT 0", (-1.0, 1.0, -1.0)),
-        (901, f"IL {width - 1}\nXL 0", (1.0, 1.0, -1.0)),
-        (902, f"IL {width - 1}\nXL {height - 1}", (1.0, 1.0, 1.0)),
-        (903, f"IL 0\nXL {height - 1}", (-1.0, 1.0, 1.0)),
-        (904, f"T {depth - 1}", (-1.0, -1.0, -1.0)),
-    ]
-    for label_id, text, (x, y, z) in anchors:
-        render_window.add_text_label(label_id, x, y, z, text, color=(0.5, 0.83, 1.0), scale=0.14)
 
 
 class Slice2DDialog(QDialog):
@@ -754,7 +755,7 @@ def main():
         active_slice_id=AXIS_INDEX["Crossline"],
     )
 
-    add_wireframe_edge_labels(render_window, volume_dim, volume_dim, volume_dim)
+    render_window.configure_axis_grid(volume_dim, volume_dim, volume_dim)
 
     tree_dock = QDockWidget("Object Tree", main_win)
     tree_dock.setWidget(build_object_tree())

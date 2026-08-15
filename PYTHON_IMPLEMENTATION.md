@@ -256,9 +256,28 @@ cena. `remove_text_label(id)`, `set_text_label_visible(id, bool)` e
 `set_text_label_position(id, x, y, z)` completam a API. Fonte cobre A-Z, 0-9 e pontuação básica
 (`- . : / _` e espaço); minúsculas são tratadas como maiúsculas automaticamente.
 
-Isso cobre labels de eixo, nome de poço, qualquer anotação 3D — não é preciso (nem recomendado)
-recriar o padrão de overlay Qt abaixo pra texto. A colorbar continua sendo `QPainter` puro (ver
+Isso cobre nome de poço e qualquer anotação 3D avulsa — não é preciso (nem recomendado) recriar
+o padrão de overlay Qt abaixo pra texto. A colorbar continua sendo `QPainter` puro (ver
 `ColorbarWidget`), porque ela fica **ao lado** do canvas no layout, não por cima — não é overlay.
+
+**Labels de eixo (INLINE/CROSSLINE/TIME numerados) não se constroem à mão com `add_text_label`
+— existe uma API dedicada:**
+
+```python
+renderer.configure_axis_grid(width, height, depth)  # mesmas dimensões de add_volume
+```
+
+Chamar uma vez (mesmo padrão "pendente" de `add_slice`: guardar e só efetivar na primeira
+`render_frame()` depois que o `Renderer` existe — ver `NebulaWindow.configure_axis_grid` no
+protótipo) cria os 3 nomes de eixo + 5 valores de tick por eixo (18 labels), com os valores reais
+já calculados a partir de `width`/`height`/`depth`. Depois disso o Rust cuida de tudo sozinho a
+cada frame: descobre qual aresta do cubo está "de costas" pra câmera atual e migra os labels/ticks
+pra lá — igual um eixo 3D de matplotlib ou o gizmo do Petrel, não um canto fixo que pode acabar na
+frente do volume depois de um orbit. Não tem por que o lado Python tentar replicar essa lógica de
+escolha de aresta; se o volume mudar de tamanho, só chamar `configure_axis_grid` de novo com as
+novas dimensões substitui o grid anterior. Tamanho da fonte dos ticks/nomes de eixo é ajustado num
+lugar só do lado Rust (`AXIS_TICK_TEXT_SCALE`/`AXIS_CAPTION_TEXT_SCALE` em `lib.rs`) — não é
+parâmetro exposto pra Python hoje.
 
 ### Se algum dia precisar de um overlay Qt de verdade (não-texto) sobre o canvas
 

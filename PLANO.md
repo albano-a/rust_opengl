@@ -35,6 +35,7 @@ Fases 1–4 concluídas. O crate `nebula/` expõe uma classe `Renderer` com esta
 | `pick_slice(screen_x, screen_y) -> Optional[id]` | descobre qual fatia está embaixo do cursor (ray-cast) |
 | `project_to_screen(x, y, z) -> Optional[(sx, sy)]` | mundo → tela, pra overlays Qt que não sejam texto |
 | `add_text_label(id, x, y, z, text, r, g, b, scale)` / `remove_text_label(id)` / `set_text_label_visible(id, bool)` / `set_text_label_position(id, x, y, z)` | texto GPU nativo (billboard, fonte bitmap embutida) — sem Qt, sem overlay |
+| `configure_axis_grid(width, height, depth)` | liga o grid numerado dos 3 eixos (INLINE/CROSSLINE/TIME, valores reais) — o Nebula escolhe sozinho, a cada frame, em qual aresta do cubo cada eixo aparece (a que está de costas pra câmera), igual um eixo 3D de matplotlib |
 | `render()` | desenha um frame |
 
 Convenção espacial fixa (cubo unitário -1..1, usada por `add_slice`/picking/labels): mundo
@@ -408,10 +409,9 @@ tenha que haver um atlas de fontes". Substituído por:
       `add_slice`: o Python decide *o quê* mostrar (o Nebula não sabe o que é um "IL" ou um
       survey), o Rust desenha.
 - [x] **`EdgeLabelsOverlay` removida inteiramente** do lado Python — nem janela-`Tool`, nem
-      `WA_AlwaysStackOnTop`, nem reposicionamento a cada frame. Os 5 labels de canto agora são
-      só 5 chamadas de `add_text_label` (uma vez, não a cada frame) em
-      `add_wireframe_edge_labels` (`embed_test.py`) — o texto acompanha orbit/pan/zoom sozinho
-      porque é geometria real da cena, não overlay 2D recalculado.
+      `WA_AlwaysStackOnTop`, nem reposicionamento a cada frame. Substituída, na correção
+      seguinte, pelo grid numerado de eixo de verdade (`configure_axis_grid`) — ver "Quinta
+      correção" abaixo.
 
 **Quarta correção — opacidade não escondia mais nada atrás dela, exceto quando não devia
 esconder nada**: com `opacity=0`, a fatia devia ficar 100% invisível — inclusive pro depth
@@ -423,6 +423,46 @@ inteiro (cor **e** profundidade), então uma fatia totalmente transparente para 
 depth test, não só visualmente. Opacidades intermediárias (ex: 50%) continuam escrevendo
 profundidade normalmente — é a limitação normal de alpha blending simples sem ordenação de
 transparência, fora de escopo por enquanto.
+
+**Quinta correção — grid de eixo numerado e adaptativo à câmera**: os 5 labels de canto fixos
+(`EdgeLabelsOverlay`/`add_wireframe_edge_labels`) mostravam só os extremos, sempre nos mesmos
+cantos, mesmo quando a câmera girava e aquele canto passava a ficar na frente do cubo (tampando
+a leitura do volume) ou virava de costas (ilegível/invertido). O usuário pediu um eixo de
+verdade: numerado feito um grid de matplotlib, com valores reais de Inline/Crossline/Time, e que
+os labels/ticks migrem sozinhos pro lado do cubo que está visível/de costas pra câmera — igual
+qualquer software 3D de verdade (Petrel, matplotlib `mplot3d`) faz.
+
+- [x] `Renderer::configure_axis_grid(width, height, depth)` (`lib.rs`): cria, uma única vez, 3
+      labels de nome de eixo ("INLINE"/"CROSSLINE"/"TIME") + 5 labels de valor de tick por eixo
+      (18 labels no total, ids reservados numa faixa própria — `AXIS_GRID_ID_BASE` — bem longe de
+      qualquer id que o lado Python normalmente escolhe). O texto de cada tick já nasce com o
+      valor real (`0`, `32`, `64`...), calculado a partir de `width`/`height`/`depth` — Time é
+      invertido (`Y=+1` é a amostra 0, mais rasa; `Y=-1` é a última amostra), mesma convenção do
+      resto do motor.
+- [x] **Posição recalculada a cada frame** (`Renderer::update_axis_grid`, chamado do `render()`):
+      nenhuma malha é retesselada — só os uniforms de posição de cada label (`queue.write_buffer`)
+      e um buffer dinâmico pequeno com os traços curtos de cada tick (desenhado pelo
+      `wireframe_pipeline` já existente, só que com um buffer próprio,
+      `axis_tick_lines_buffer`). A cada frame: pega a direção câmera→alvo, e pra cada um dos 3
+      eixos escolhe a aresta do cubo cujas duas coordenadas fixas são o lado **oposto** de onde a
+      câmera está (`axis_grid_point`) — ou seja, a aresta "de trás", que nunca cruza o volume
+      renderizado nem fica de cabeça pra baixo, não importa o ângulo de orbit.
+- [x] **Tamanho de fonte configurável num lugar só**: duas constantes no topo de `lib.rs`
+      (`AXIS_TICK_TEXT_SCALE`, `AXIS_CAPTION_TEXT_SCALE`) — antes cada `add_text_label` espalhado
+      pelo `embed_test.py` tinha sua própria `scale` fixa (e grande demais, "0.14"); agora ajustar
+      o tamanho do grid inteiro é mudar duas linhas, sem tocar em nenhuma chamada.
+- [x] `add_wireframe_edge_labels` removida do `embed_test.py`; `main()` chama
+      `render_window.configure_axis_grid(volume_dim, volume_dim, volume_dim)` uma vez (mesmo
+      padrão "pendente" de `add_slice`/`add_text_label` — só efetiva na primeira `render_frame()`
+      depois que o `Renderer` existe).
+- [x] Verificado por screenshot real (`Graphics.CopyFromScreen`) na visão inicial (reta, olhando
+      pro eixo Z): INLINE aparece embaixo do cubo com `0, 32, 64, 95, 127`, CROSSLINE na diagonal
+      inferior esquerda, TIME na lateral esquerda — todos nas arestas de trás, letra pequena e
+      legível, sem sobrepor a fatia sísmica. **Lacuna de verificação**: não consegui uma captura
+      de tela limpa confirmando visualmente a troca de aresta *depois* de orbitar (problema da
+      ferramenta de captura nesta sessão, não do código — mesma classe de limitação já registrada
+      na correção da opacidade); a lógica em si é álgebra vetorial determinística (inverte o sinal
+      da direção câmera→alvo por eixo) e compilou/rodou sem erro em todos os testes.
 
 ## Fase 5 — Objetos sísmicos específicos (planejada)
 
