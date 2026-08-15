@@ -145,24 +145,36 @@ Decidida antes da Fase 4: iluminação de rasterização clássica (nada de ray 
 demais pro objetivo aqui, que é clareza dos dados, não fotorrealismo, e `wgpu` ainda tem
 suporte a ray tracing só experimental).
 
+Primeira versão tinha dois problemas encontrados em revisão visual (comparando com
+referências reais do Petrel/Ocean): o objeto girava sozinho (nunca foi pedido, foi uma
+suposição errada) e a luz era fixa no mundo, o que deixa faces do objeto escuras dependendo do
+ângulo — errado pra uma ferramenta onde o objetivo é conseguir *ler* a fatia sísmica de
+qualquer ângulo, não simular iluminação realista. Corrigido pra:
+
+- [x] Objeto **parado** — só a câmera orbita (igual Fase 2). `model` na `SceneUniform` fica
+      sempre `Mat4::IDENTITY` por enquanto (a infraestrutura de model matrix continua útil pra
+      Fase 5, só não gira sozinha).
+- [x] Luz vira **headlight**: `light_position` recalculada todo frame como `camera.eye()`, em
+      vez de uma posição fixa no mundo. Como a luz acompanha a câmera, o lado que você está
+      olhando fica sempre bem iluminado — e isso já basta pra difusa "reagir" ao orbitar,
+      sem precisar girar o objeto.
+- [x] Normal de face dupla no `volume_slice.wgsl`: como o quad é um plano sem espessura (só
+      uma normal por vértice), a normal é virada pro lado do observador
+      (`dot(normal, view_dir) < 0.0 → normal = -normal`) antes de calcular a difusa — sem isso,
+      olhar o objeto "por trás" apagava a face errada.
 - [x] `SliceVertex` ganhou `normal: [f32; 3]` (constante `(0,0,1)` pro quad plano — superfícies
       curvas da Fase 5 vão precisar de normais de verdade por vértice)
-- [x] Luz pontual **fixa no mundo** (não presa à câmera nem ao objeto): `light_position` fixo
-      em `Renderer`, `Vec3::new(4.0, 5.0, 3.0)`
-- [x] Rotação real do objeto: `model` matrix separada da `view_proj` da câmera, girando
-      sozinha (`Mat4::from_rotation_y`, `MODEL_ROTATION_SPEED` rad/s) — sem isso, a difusa
-      não teria motivo pra mudar, já que ela só depende do ângulo normal↔luz, não de onde a
-      câmera está olhando (diferente do especular, que reage à órbita da câmera)
 - [x] `SceneUniform` (`nebula/src/lib.rs`): um bind group só (`@group(0)`) juntando
-      `view_proj` + `model` + `light_position` + `camera_position` — evita um terceiro bind
-      group pra "mais um uniform de câmera"
-- [x] Shading no `volume_slice.wgsl`: `albedo * (ambient + diffuse) + especular`
-      (Lambertian + Blinn-Phong), `albedo` continua sendo o valor amostrado do volume
+      `view_proj` + `model` + `light_position` + `camera_position`
+- [x] Shading no `volume_slice.wgsl`: `albedo * (ambient + diffuse)` — só Lambertian, sem
+      especular. Testamos com Blinn-Phong primeiro, mas com a luz colada na câmera o brilho
+      especular fica sempre grudado bem no centro da tela (parece plástico/molhado) — errado
+      pra uma fatia sísmica, que é fosca. `albedo` continua sendo o valor amostrado do volume.
 
-**Critério de saída**: confirmado visualmente — capturas em momentos diferentes mostram o quad
-girando sozinho (forma/perspectiva mudando por conta da `model` matrix, não da câmera) e o
-gradiente de sombreamento se deslocando junto, provando que a difusa é recalculada por frame,
-não é uma cor "assada".
+**Critério de saída**: confirmado visualmente — capturas seguidas sem interação são idênticas
+(objeto não gira sozinho); depois de orbitar a câmera, a superfície fica visivelmente mais
+clara/legível na nova direção de visão, com o gradiente de sombra mudando de lado — luz
+seguindo a câmera, exatamente o comportamento do Petrel usado como referência.
 
 ## Fases seguintes
 
