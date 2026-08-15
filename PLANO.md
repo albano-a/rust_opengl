@@ -263,14 +263,48 @@ fatia que já está inteira na GPU — o que também acelera o 3D (mesma estrutu
       `Renderer` tem seu próprio `wgpu::Device`, o diálogo 2D sobe o mesmo array numpy que já
       está em memória Python pro seu próprio `Renderer` — duplica um pouco de VRAM, mas evita a
       complexidade de compartilhar device/texturas entre janelas (não vale a pena agora).
-- [x] **Ctrl+arrastar folheia a fatia**: em vez de só orbitar/pan, segurar Ctrl e arrastar (em
-      qualquer botão) muda a posição ao longo do eixo atual — vale nas duas visões (3D e 2D).
-      `NebulaWindow.on_axis_index_changed` notifica quem hospeda a janela (`Slice2DDialog`) pra
-      manter slider/combobox sincronizados mesmo quando a mudança vem do drag, não do widget.
+- [x] **Ctrl+arrastar folheia a fatia ativa**: segurar Ctrl (ou apertar "Mover" na toolbar) e
+      arrastar move a fatia ativa ao longo do seu próprio eixo, em vez de orbitar a câmera.
+      `NebulaWindow.on_slice_changed` notifica quem hospeda a janela (`Slice2DDialog`) pra manter
+      slider/combobox sincronizados mesmo quando a mudança vem do drag, não do widget.
+
+**Correção importante (pós-teste visual contra referência Petrel/Ocean)**: a primeira versão
+desta fase mostrava só **uma** fatia por vez, sempre um quad plano fixo de frente pra câmera —
+"folhear" só trocava a textura amostrada, a geometria nunca se mexia no espaço. Errado: o pedido
+sempre foi um **cubo sísmico de verdade**, com as três fatias (Inline/Crossline/Time) visíveis
+**ao mesmo tempo**, como três planos perpendiculares que se cruzam dentro de uma caixa com
+wireframe ao redor — exatamente como Petrel/Ocean mostram. Corrigido:
+
+- [x] `SliceParams` (`@group(3)`) ganhou um `model: mat4x4<f32>` — cada fatia agora tem sua
+      própria transformação no espaço 3D do cubo (rotação + translação), não só o `axis`/`index`
+      que escolhe a coordenada de textura. `slice_model_matrix(axis, index)` (`lib.rs`) gira o
+      quad plano de origem (que nasce no plano XY local) pra ficar perpendicular ao eixo certo e
+      o translada até a posição normalizada. Convenção espacial do cubo: mundo X=Inline,
+      Y=Time, Z=Crossline (cubo unitário -1..1).
+- [x] Wireframe da caixa (`geometry.rs`: `LineVertex`/`WIREFRAME_VERTICES`/`WIREFRAME_INDICES`,
+      `wireframe.wgsl`, novo `wireframe_pipeline`): 12 arestas de um cubo -1..1, desenhado com
+      depth sempre passando e sem escrever no depth buffer — é referência espacial, fica visível
+      por cima das fatias, não interage com elas.
+- [x] `Renderer` passou a suportar várias fatias simultâneas de verdade (já dava pra isso desde
+      o `HashMap<id, SliceEntry>`, só faltava o lado Python aproveitar): o demo agora adiciona
+      as três (Inline/Crossline/Time) ao mesmo tempo por padrão.
+- [x] **Semântica da combobox corrigida**: no Andromeda, a combobox de eixo só *seleciona qual*
+      fatia vai ser movida — quem move de verdade é apertar o botão "Mover" (modo liga/desliga)
+      e arrastar. Não era pra combobox sozinha resetar a posição pro meio. Corrigido:
+      `NebulaWindow.active_slice_id` (setado pela combobox) + `set_move_mode` (botão "Mover") +
+      Ctrl+arrastar como atalho adicional (não existe no Andromeda, mas não atrapalha).
+- [x] **`nudge_slice(slice_id, screen_dx, screen_dy)`** (`lib.rs`): antes o drag usava
+      `dy * sensibilidade` fixo, sem relação com a orientação real da fatia. Agora projeta a
+      direção do eixo de movimento da fatia (mundo) pra tela sob a câmera atual (`view_proj`) e
+      usa a componente do arrasto do mouse alinhada com essa direção — arrastar "ao longo" do
+      eixo do grid na tela avança a fatia de verdade, arrastar perpendicular a ele quase não
+      move nada. Só faz sentido pra câmera orbital 3D (na visão 2D ortográfica o eixo de
+      movimento aponta pra dentro da tela, sem direção projetável — lá continua usando `dy` direto).
 
 **Fora de escopo desta fase** (fica pra Fase 5, dependem dos dados de horizonte/poço existirem
 primeiro): ray marching/transfer functions pro volume 3D cheio (fácies/corpo geológico),
-horizonte como linha sobreposta na seção 2D, traço do poço sobreposto na seção 2D.
+horizonte como linha sobreposta na seção 2D, traço do poço sobreposto na seção 2D, ticks/labels
+numéricos (IL/XL/Time) ao redor do wireframe — por enquanto só a caixa, sem texto.
 
 ## Fases seguintes
 

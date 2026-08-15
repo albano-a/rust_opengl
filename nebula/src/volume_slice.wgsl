@@ -25,10 +25,14 @@ var colormap_sampler: sampler;
 @group(2) @binding(2)
 var<uniform> clim: vec4<f32>; // x = min, y = max; zw não usados (padding)
 
-// Qual eixo do volume esta fatia mostra e em que posição normalizada (0..1)
-// ao longo dele. axis: 0 = Inline, 1 = Crossline, 2 = Time — mesma convenção
-// do `AXIS_CONFIG` do diálogo 2D do Andromeda.
+// Qual eixo do volume esta fatia mostra, em que posição normalizada (0..1)
+// ao longo dele, e onde/como o quad plano precisa ficar no espaço 3D do
+// cubo sísmico pra representar fisicamente essa posição (não é só uma
+// questão de textura — a fatia Inline e a Crossline são planos perpendiculares
+// de verdade, que se cruzam dentro do cubo). axis: 0 = Inline, 1 = Crossline,
+// 2 = Time — mesma convenção do `AXIS_CONFIG` do diálogo 2D do Andromeda.
 struct SliceParams {
+    model: mat4x4<f32>,
     axis: u32,
     index: f32,
     _pad: vec2<f32>,
@@ -54,14 +58,22 @@ struct VertexOutput {
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
 
-    let world_position = scene.model * vec4<f32>(input.position, 1.0);
+    // `scene.model` é a transformação do cubo sísmico inteiro (identidade por
+    // enquanto — útil quando o Nebula posicionar vários surveys um dia).
+    // `slice.model` é a transformação *desta fatia* dentro do cubo: rotaciona
+    // o quad plano pra ficar perpendicular ao eixo certo e translada até a
+    // posição normalizada — é isso que faz Inline/Crossline/Time aparecerem
+    // como três planos de verdade se cruzando dentro do cubo, não só uma
+    // textura diferente no mesmo quad fixo.
+    let world_position = scene.model * slice.model * vec4<f32>(input.position, 1.0);
     out.world_position = world_position.xyz;
     out.clip_position = scene.view_proj * world_position;
     out.uv = input.uv;
 
-    // `model` só tem rotação (sem escala não-uniforme), então transformar a
-    // normal por ele direto já é correto — não precisa da inversa-transposta.
-    out.world_normal = normalize((scene.model * vec4<f32>(input.normal, 0.0)).xyz);
+    // Nem `scene.model` nem `slice.model` têm escala não-uniforme, então
+    // transformar a normal por eles direto já é correto — não precisa da
+    // inversa-transposta.
+    out.world_normal = normalize((scene.model * slice.model * vec4<f32>(input.normal, 0.0)).xyz);
 
     return out;
 }

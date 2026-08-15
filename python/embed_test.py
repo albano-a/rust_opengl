@@ -198,8 +198,15 @@ class NebulaWindow(QWindow):
 
     `mode="orbit"` é a visão 3D de sempre (Fase 2+); `mode="panzoom"` é a
     visão 2D (Fase 4) — câmera ortográfica sem rotação, sem iluminação,
-    usada pelo `Slice2DDialog`. É a mesma classe pros dois casos: o volume
-    que ela mostra é sempre o objeto `Renderer.add_slice`/`add_volume` id=0.
+    usada pelo `Slice2DDialog`. É a mesma classe pros dois casos.
+
+    Pode mostrar várias fatias ao mesmo tempo (`configure_slices`) — no cubo
+    3D, as três (Inline/Crossline/Time) ficam sempre visíveis simultaneamente,
+    como três planos de verdade se cruzando dentro do volume (igual o Ocean/
+    Petrel), não um quad só trocando de conteúdo. Uma delas é a "fatia ativa"
+    (`active_slice_id`): é nela que a combobox de eixo do Andromeda e o
+    Ctrl+arrastar atuam — a combobox só *seleciona qual* fatia mexer, quem
+    efetivamente move é o botão "Mover" (`set_move_mode`) ou o Ctrl+arrastar.
     """
 
     def __init__(self, mode: str = "orbit"):
@@ -213,12 +220,23 @@ class NebulaWindow(QWindow):
         self._pending_volume = None
         self._pending_colormap = None
         self._pending_clim = None
-        self._slice_added = False
-        self._axis_index = (AXIS_INDEX["Crossline"], 0.5)
-        # Chamado (axis, index) sempre que a fatia muda, inclusive por
-        # Ctrl+arrastar — quem hospeda a janela (ex: Slice2DDialog) pode
-        # plugar aqui pra manter slider/combobox em sincronia.
-        self.on_axis_index_changed = None
+        # slice_id -> (axis, index); adicionadas de verdade no Rust na
+        # primeira render_frame() depois que o Renderer existe.
+        self._slices = {}
+        self._slices_added = set()
+        self.active_slice_id = None
+        self.move_mode = False
+        # Chamado (slice_id, axis, index) sempre que uma fatia muda, inclusive
+        # por Ctrl+arrastar/Mover — quem hospeda a janela (ex: Slice2DDialog)
+        # pode plugar aqui pra manter slider/combobox em sincronia.
+        self.on_slice_changed = None
+
+    def configure_slices(self, slices: dict, active_slice_id):
+        """Define o conjunto de fatias mostradas (chamar antes do primeiro
+        `render_frame`, ou seja, antes da janela aparecer) — `slices` é
+        `{slice_id: (axis, index)}`."""
+        self._slices = dict(slices)
+        self.active_slice_id = active_slice_id
 
     def set_volume(self, width: int, height: int, depth: int, data: np.ndarray):
         # O Renderer só existe depois do primeiro resize real (winId() só é
@@ -232,13 +250,19 @@ class NebulaWindow(QWindow):
     def set_clim(self, min_value: float, max_value: float):
         self._pending_clim = (min_value, max_value)
 
-    def set_axis_index(self, axis: int, index: float):
-        self._axis_index = (axis, index)
+    def set_move_mode(self, enabled: bool):
+        # Equivalente ao botão "Mover" do Andromeda: com o modo ativo, um
+        # arrasto simples (sem precisar de Ctrl) já move a fatia ativa em vez
+        # de orbitar a câmera.
+        self.move_mode = bool(enabled)
+
+    def set_slice(self, slice_id: int, axis: int, index: float):
+        self._slices[slice_id] = (axis, index)
         renderer = self._renderer
-        if renderer is not None and self._slice_added:
-            renderer.set_slice_axis_index(0, axis, index)
-        if self.on_axis_index_changed is not None:
-            self.on_axis_index_changed(axis, index)
+        if renderer is not None and slice_id in self._slices_added:
+            renderer.set_slice_axis_index(slice_id, axis, index)
+        if self.on_slice_changed is not None:
+            self.on_slice_changed(slice_id, axis, index)
 
     def shutdown(self):
         # Chamado antes do Qt começar a destruir a janela nativa: depois disso,
@@ -279,9 +303,10 @@ class NebulaWindow(QWindow):
             renderer.set_volume_clim(0, *self._pending_clim)
             self._pending_clim = None
 
-        if not self._slice_added:
-            renderer.add_slice(0, 0, *self._axis_index)
-            self._slice_added = True
+        for slice_id, (axis, index) in self._slices.items():
+            if slice_id not in self._slices_added:
+                renderer.add_slice(slice_id, 0, axis, index)
+                self._slices_added.add(slice_id)
 
         renderer.render()
 
@@ -305,13 +330,26 @@ class NebulaWindow(QWindow):
         dy = float(pos.y() - self._last_pos.y())
         self._last_pos = pos
 
-        if event.modifiers() & Qt.ControlModifier:
-            # Ctrl+arrastar (em qualquer botão) "folheia" a fatia — muda a
-            # posição ao longo do eixo atual em vez de mexer na câmera. Vale
-            # tanto na visão 3D orbital quanto na 2D pan/zoom.
-            axis, index = self._axis_index
-            index = min(1.0, max(0.0, index + dy * 0.002))
-            self.set_axis_index(axis, index)
+        want_move = self.move_mode or bool(event.modifiers() & Qt.ControlModifier)
+        if want_move and self.active_slice_id is not None and self.active_slice_id in self._slices:
+            axis, _old_index = self._slices[self.active_slice_id]
+            if self._mode == "orbit":
+                # Projeta a direção do eixo de movimento da fatia (em
+                # coordenadas de mundo, sob a câmera atual) pra tela, e usa a
+                # componente do arrasto alinhada com essa direção — arrastar
+                # "ao longo" do eixo do grid avança a fatia de verdade,
+                # arrastar perpendicular não faz quase nada.
+                new_index = renderer.nudge_slice(self.active_slice_id, dx, dy)
+            else:
+                # Visão 2D: a fatia ativa aparece de frente, então "mover ao
+                # longo do eixo" é ir pra dentro/fora da tela — não existe
+                # direção de arrasto pra projetar, então usa dy direto.
+                _axis, index = self._slices[self.active_slice_id]
+                new_index = min(1.0, max(0.0, index + dy * 0.002))
+                renderer.set_slice_axis_index(self.active_slice_id, axis, new_index)
+            self._slices[self.active_slice_id] = (axis, new_index)
+            if self.on_slice_changed is not None:
+                self.on_slice_changed(self.active_slice_id, axis, new_index)
             return
 
         if self._mode == "panzoom":
@@ -432,24 +470,33 @@ class Slice2DDialog(QDialog):
         self._render_window.set_volume(volume_dim, volume_dim, volume_dim, volume_data)
         self._render_window.set_colormap(colormap_lut)
         self._render_window.set_clim(*clim)
-        self._render_window.set_axis_index(AXIS_INDEX["Crossline"], 0.5)
+        # O diálogo 2D mostra uma fatia por vez (a que o combobox escolher) —
+        # diferente do cubo 3D, que mostra as três ao mesmo tempo.
+        self._render_window.configure_slices({0: (AXIS_INDEX["Crossline"], 0.5)}, active_slice_id=0)
 
-        self._axis_combo.currentTextChanged.connect(self._on_axis_or_position_changed)
-        self._position_slider.valueChanged.connect(self._on_axis_or_position_changed)
+        self._axis_combo.currentTextChanged.connect(self._on_axis_changed)
+        self._position_slider.valueChanged.connect(self._on_position_changed)
         # Ctrl+arrastar dentro do canvas muda a fatia sem passar pelo slider —
         # mantém o slider/combobox mostrando a posição de verdade mesmo assim.
-        self._render_window.on_axis_index_changed = self._on_render_axis_index_changed
+        self._render_window.on_slice_changed = self._on_render_slice_changed
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._render_window.render_frame)
         self._timer.start(16)
 
-    def _on_axis_or_position_changed(self, *_args):
+    def _on_axis_changed(self, name: str):
+        # Igual o Andromeda: trocar de eixo reseta pro meio do volume.
+        self._render_window.set_slice(0, AXIS_INDEX[name], 0.5)
+        self._position_slider.blockSignals(True)
+        self._position_slider.setValue(self._position_slider.maximum() // 2)
+        self._position_slider.blockSignals(False)
+
+    def _on_position_changed(self, _value: int):
         axis = AXIS_INDEX[self._axis_combo.currentText()]
         index = self._position_slider.value() / self._position_slider.maximum()
-        self._render_window.set_axis_index(axis, index)
+        self._render_window.set_slice(0, axis, index)
 
-    def _on_render_axis_index_changed(self, axis: int, index: float):
+    def _on_render_slice_changed(self, _slice_id: int, axis: int, index: float):
         self._axis_combo.blockSignals(True)
         self._axis_combo.setCurrentText(AXIS_NAMES[axis])
         self._axis_combo.blockSignals(False)
@@ -492,18 +539,26 @@ def build_object_tree() -> QTreeWidget:
 
 
 def build_slices_toolbar(main_win: QMainWindow, render_window: "NebulaWindow", open_2d_callback) -> QToolBar:
-    """Réplica simplificada da slicesToolBar do Andromeda (seletor de eixo +
-    combobox de exagero vertical), agora ligada de verdade ao Nebula
-    (Fase 4): trocar o eixo aqui muda a fatia 3D ao vivo."""
+    """Réplica da slicesToolBar do Andromeda — e do jeito certo (Fase 4,
+    corrigido): a combobox só *seleciona qual* das três fatias (Inline/
+    Crossline/Time, sempre as três visíveis ao mesmo tempo no cubo) vai ser
+    movida; quem move de verdade é apertar "Mover" (fica pressionado — modo
+    ligado) e arrastar o mouse, ou Ctrl+arrastar a qualquer momento como
+    atalho. A combobox não muda a posição sozinha."""
     toolbar = QToolBar("Slices", main_win)
 
     axis_combo = QComboBox()
     axis_combo.addItems(AXIS_NAMES)
     axis_combo.setCurrentText("Crossline")
     axis_combo.currentTextChanged.connect(
-        lambda name: render_window.set_axis_index(AXIS_INDEX[name], 0.5)
+        lambda name: setattr(render_window, "active_slice_id", AXIS_INDEX[name])
     )
     toolbar.addWidget(axis_combo)
+
+    move_action = QAction("Mover", main_win)
+    move_action.setCheckable(True)
+    move_action.toggled.connect(render_window.set_move_mode)
+    toolbar.addAction(move_action)
 
     toolbar.addSeparator()
 
@@ -544,6 +599,18 @@ def main():
     render_window.set_volume(volume_dim, volume_dim, volume_dim, volume_data)
     render_window.set_colormap(colormap_lut)
     render_window.set_clim(*clim)
+    # As três fatias (Inline/Crossline/Time) sempre visíveis ao mesmo tempo,
+    # cruzando dentro do cubo — ids batendo com o índice do eixo, já que só
+    # existe uma fatia por eixo neste protótipo. Crossline começa ativa (era
+    # a única fatia mostrada nas fases anteriores).
+    render_window.configure_slices(
+        {
+            AXIS_INDEX["Inline"]: (AXIS_INDEX["Inline"], 0.5),
+            AXIS_INDEX["Crossline"]: (AXIS_INDEX["Crossline"], 0.5),
+            AXIS_INDEX["Time"]: (AXIS_INDEX["Time"], 0.5),
+        },
+        active_slice_id=AXIS_INDEX["Crossline"],
+    )
 
     tree_dock = QDockWidget("Object Tree", main_win)
     tree_dock.setWidget(build_object_tree())

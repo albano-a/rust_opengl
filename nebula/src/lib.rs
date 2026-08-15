@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::num::NonZeroIsize;
 
 use bytemuck::{Pod, Zeroable};
-use glam::Mat4;
+use glam::{Mat4, Vec2, Vec3};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -15,7 +15,9 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle, Win32WindowHandle, Wi
 
 use camera::{CameraKind, OrbitCamera, PanZoomCamera};
 use colormap::Colormap;
-use geometry::{SliceVertex, SLICE_INDICES, SLICE_VERTICES};
+use geometry::{
+    LineVertex, SliceVertex, SLICE_INDICES, SLICE_VERTICES, WIREFRAME_INDICES, WIREFRAME_VERTICES,
+};
 use volume::Volume3D;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -45,9 +47,48 @@ struct SceneUniform {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct SliceParamsUniform {
+    model: [[f32; 4]; 4],
     axis: u32,
     index: f32,
     _pad: [f32; 2],
+}
+
+// Convenção espacial do cubo sísmico (cubo unitário -1..1 em cada eixo,
+// mesma caixa do wireframe em geometry.rs): mundo X = Inline, mundo Y =
+// Time (fatia rasa fica em cima), mundo Z = Crossline. `slice_move_axis`
+// devolve a direção de translação de cada tipo de fatia; `slice_model_matrix`
+// gira o quad plano (que nasce na origem, no plano XY local) pra ficar
+// perpendicular ao eixo certo e o translada até a posição normalizada
+// (0..1 -> -1..1) — é isso que faz Inline/Crossline/Time virarem três
+// planos de verdade se cruzando dentro do cubo, em vez de um quad fixo só
+// trocando de textura.
+fn slice_move_axis(axis: u32) -> Vec3 {
+    match axis {
+        0 => Vec3::X, // Inline
+        2 => Vec3::Y, // Time
+        _ => Vec3::Z, // Crossline
+    }
+}
+
+fn slice_model_matrix(axis: u32, index: f32) -> Mat4 {
+    let pos = index.clamp(0.0, 1.0) * 2.0 - 1.0;
+    match axis {
+        0 => {
+            // Inline fixo em X=pos; plano varre Crossline (Z) e Time (Y).
+            Mat4::from_translation(Vec3::new(pos, 0.0, 0.0))
+                * Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2)
+        }
+        2 => {
+            // Time fixo em Y=pos; plano varre Inline (X) e Crossline (Z).
+            Mat4::from_translation(Vec3::new(0.0, pos, 0.0))
+                * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2)
+        }
+        _ => {
+            // Crossline fixo em Z=pos; plano varre Inline (X) e Time (Y) —
+            // é o quad plano na sua orientação original, só transladado.
+            Mat4::from_translation(Vec3::new(0.0, 0.0, pos))
+        }
+    }
 }
 
 /// Um volume carregado na GPU (textura 3D) junto com o colormap/clim usados
@@ -111,6 +152,11 @@ struct Renderer {
     slice_vertex_buffer: wgpu::Buffer,
     slice_index_buffer: wgpu::Buffer,
     num_slice_indices: u32,
+
+    wireframe_pipeline: wgpu::RenderPipeline,
+    wireframe_vertex_buffer: wgpu::Buffer,
+    wireframe_index_buffer: wgpu::Buffer,
+    num_wireframe_indices: u32,
 
     volume_bind_group_layout: wgpu::BindGroupLayout,
     colormap_bind_group_layout: wgpu::BindGroupLayout,
@@ -297,7 +343,10 @@ impl Renderer {
                 label: Some("slice_params_bind_group_layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    // VERTEX porque `slice.model` posiciona o quad no
+                    // espaço 3D (Fase 4); FRAGMENT porque `slice.axis`/
+                    // `slice.index` ainda escolhem a coordenada amostrada.
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -373,6 +422,76 @@ impl Renderer {
             },
         );
 
+        // Wireframe da caixa do cubo: pipeline separado e bem mais simples
+        // (sem textura, sem luz) — só a câmera (`@group(0)`), position+color
+        // por vértice, desenhado como `LineList`. Depth sempre passa e nunca
+        // escreve: é uma referência espacial que deve ficar visível por cima
+        // de tudo, não geometria que oclui ou é ocluída pelas fatias.
+        let wireframe_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("wireframe_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("wireframe.wgsl").into()),
+        });
+
+        let wireframe_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("wireframe_pipeline_layout"),
+                bind_group_layouts: &[Some(&scene_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let wireframe_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("wireframe_pipeline"),
+            layout: Some(&wireframe_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &wireframe_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Some(LineVertex::layout())],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &wireframe_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let wireframe_vertex_buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("wireframe_vertex_buffer"),
+                contents: bytemuck::cast_slice(&WIREFRAME_VERTICES),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        );
+
+        let wireframe_index_buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("wireframe_index_buffer"),
+                contents: bytemuck::cast_slice(&WIREFRAME_INDICES),
+                usage: wgpu::BufferUsages::INDEX,
+            },
+        );
+
         Ok(Self {
             surface,
             device,
@@ -386,6 +505,10 @@ impl Renderer {
             slice_vertex_buffer,
             slice_index_buffer,
             num_slice_indices: SLICE_INDICES.len() as u32,
+            wireframe_pipeline,
+            wireframe_vertex_buffer,
+            wireframe_index_buffer,
+            num_wireframe_indices: WIREFRAME_INDICES.len() as u32,
             volume_bind_group_layout,
             colormap_bind_group_layout,
             slice_params_bind_group_layout,
@@ -537,11 +660,17 @@ impl Renderer {
             )));
         }
 
+        let model = slice_model_matrix(axis, index);
         let params_buffer = wgpu::util::DeviceExt::create_buffer_init(
             &self.device,
             &wgpu::util::BufferInitDescriptor {
                 label: Some("slice_params_buffer"),
-                contents: bytemuck::cast_slice(&[SliceParamsUniform { axis, index, _pad: [0.0; 2] }]),
+                contents: bytemuck::cast_slice(&[SliceParamsUniform {
+                    model: model.to_cols_array_2d(),
+                    axis,
+                    index,
+                    _pad: [0.0; 2],
+                }]),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             },
         );
@@ -583,14 +712,58 @@ impl Renderer {
             .slices
             .get_mut(&slice_id)
             .ok_or_else(|| PyRuntimeError::new_err(format!("slice {slice_id} não encontrada")))?;
+        let index = index.clamp(0.0, 1.0);
         slice.axis = axis;
         slice.index = index;
+        let model = slice_model_matrix(axis, index);
         self.queue.write_buffer(
             &slice.params_buffer,
             0,
-            bytemuck::cast_slice(&[SliceParamsUniform { axis, index, _pad: [0.0; 2] }]),
+            bytemuck::cast_slice(&[SliceParamsUniform {
+                model: model.to_cols_array_2d(),
+                axis,
+                index,
+                _pad: [0.0; 2],
+            }]),
         );
         Ok(())
+    }
+
+    /// "Folheia" uma fatia arrastando o mouse na tela (`screen_dx`,
+    /// `screen_dy` em pixels), movendo-a fisicamente ao longo do seu próprio
+    /// eixo no grid 3D — não um heurístico genérico de "arrastar pra baixo
+    /// sempre avança". Projeta a direção do eixo de movimento da fatia
+    /// (Inline/Time/Crossline, em coordenadas de mundo) pra tela sob a
+    /// câmera atual, e usa a componente do arrasto do mouse alinhada com essa
+    /// direção — arrastar "ao longo" do eixo do grid avança a fatia,
+    /// arrastar perpendicular a ele não faz quase nada. Devolve o novo
+    /// `index` (0..1) pro lado Python manter slider/combobox sincronizados.
+    fn nudge_slice(&mut self, slice_id: u64, screen_dx: f32, screen_dy: f32) -> PyResult<f32> {
+        let (axis, index) = {
+            let slice = self
+                .slices
+                .get(&slice_id)
+                .ok_or_else(|| PyRuntimeError::new_err(format!("slice {slice_id} não encontrada")))?;
+            (slice.axis, slice.index)
+        };
+
+        let move_axis = slice_move_axis(axis);
+        let view_proj = self.camera.view_proj();
+        let pos = move_axis * (index * 2.0 - 1.0);
+        let eps = 0.05;
+        let a = view_proj * (pos - move_axis * eps).extend(1.0);
+        let b = view_proj * (pos + move_axis * eps).extend(1.0);
+        let a_ndc = a.truncate() / a.w.abs().max(1e-4);
+        let b_ndc = b.truncate() / b.w.abs().max(1e-4);
+        // Tela: X igual à NDC, Y invertido (NDC +Y é pra cima, tela +Y é pra baixo).
+        let raw_dir = Vec2::new(b_ndc.x - a_ndc.x, -(b_ndc.y - a_ndc.y));
+        let screen_dir = if raw_dir.length_squared() > 1e-6 { raw_dir.normalize() } else { Vec2::X };
+
+        let along = screen_dx * screen_dir.x + screen_dy * screen_dir.y;
+        let new_index = (index + along * 0.003).clamp(0.0, 1.0);
+
+        self.set_slice_axis_index(slice_id, axis, new_index)?;
+        Ok(new_index)
     }
 
     fn render(&mut self) -> PyResult<()> {
@@ -686,6 +859,16 @@ impl Renderer {
                 render_pass.set_bind_group(3, &slice.params_bind_group, &[]);
                 render_pass.draw_indexed(0..self.num_slice_indices, 0, 0..1);
             }
+
+            // Wireframe por cima de tudo (depth sempre passa) — é a
+            // referência espacial do cubo, precisa ficar visível mesmo
+            // atravessando as fatias.
+            render_pass.set_pipeline(&self.wireframe_pipeline);
+            render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.wireframe_vertex_buffer.slice(..));
+            render_pass
+                .set_index_buffer(self.wireframe_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..self.num_wireframe_indices, 0, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
