@@ -83,12 +83,25 @@ def _ricker_wavelet(length: int, freq: float) -> np.ndarray:
     return ((1.0 - 2.0 * a) * np.exp(-a)).astype(np.float32)
 
 
-def build_seismic_volume(width=64, height=64, depth=64, n_reflectors=6, seed=7):
+def build_seismic_volume(
+    width=128,
+    height=128,
+    depth=128,
+    n_reflectors=16,
+    n_faults=3,
+    channel=True,
+    seed=7,
+):
     """Sísmica sintética de verdade: refletores em camadas (com mergulho e
     dobra suaves, diferentes por camada) convolvidos com uma wavelet Ricker ao
     longo do eixo de profundidade — o mesmo princípio (refletividade × wavelet)
     usado em modelagem sísmica convolucional real, só que sem física de
     propagação de onda por trás.
+
+    Mais complexo que a versão original da Fase 3.7: falhas normais (degraus
+    nas camadas) e um corpo de canal sinuoso — dá pra testar o cubo com algo
+    que não seja só camadas paralelas planas, mais parecido com um survey de
+    verdade.
     """
     rng = np.random.default_rng(seed)
 
@@ -98,8 +111,17 @@ def build_seismic_volume(width=64, height=64, depth=64, n_reflectors=6, seed=7):
 
     reflectivity = np.zeros((depth, height, width), dtype=np.float32)
 
-    base_positions = np.sort(rng.uniform(0.15, 0.85, n_reflectors))
+    base_positions = np.sort(rng.uniform(0.08, 0.92, n_reflectors))
     strengths = rng.uniform(-1.0, 1.0, n_reflectors)
+
+    # Falhas normais simples: cada uma desloca (em amostras) tudo que está de
+    # um lado de um plano de falha — que também pode ser inclinado com a
+    # profundidade — criando as descontinuidades em degrau típicas de uma
+    # seção real, que um empilhado de camadas paralelas nunca mostra.
+    faults = [
+        (rng.uniform(0.2, 0.8), rng.uniform(-0.3, 0.3), int(rng.integers(3, 10)) * int(rng.choice([-1, 1])))
+        for _ in range(n_faults)
+    ]
 
     for pos, strength in zip(base_positions, strengths):
         # Mergulho (plano inclinado) + dobra (senoide) — cada refletor com sua
@@ -107,8 +129,8 @@ def build_seismic_volume(width=64, height=64, depth=64, n_reflectors=6, seed=7):
         # planos paralelos perfeitos.
         dip_x = rng.uniform(-0.06, 0.06)
         dip_y = rng.uniform(-0.04, 0.04)
-        fold_amp = rng.uniform(0.01, 0.04)
-        fold_freq = rng.uniform(1.0, 2.5)
+        fold_amp = rng.uniform(0.01, 0.05)
+        fold_freq = rng.uniform(1.0, 3.0)
         fold_phase = rng.uniform(0.0, 2 * np.pi)
 
         undulation = (
@@ -116,17 +138,38 @@ def build_seismic_volume(width=64, height=64, depth=64, n_reflectors=6, seed=7):
             + dip_y * (yn - 0.5)
             + fold_amp * np.sin(2 * np.pi * fold_freq * xn + fold_phase)
         )
-        depth_idx = np.clip(
-            np.round((pos + undulation) * (depth - 1)).astype(np.int32), 0, depth - 1
-        )
+        depth_f = (pos + undulation) * (depth - 1)
+
+        for fault_x, fault_dip, throw in faults:
+            fault_plane = fault_x * (width - 1) + fault_dip * (depth_f - depth_f.mean())
+            depth_f = np.where(x_idx > fault_plane, depth_f + throw, depth_f)
+
+        depth_idx = np.clip(np.round(depth_f).astype(np.int32), 0, depth - 1)
         np.add.at(reflectivity, (depth_idx, y_idx, x_idx), strength)
 
     # Convolve cada traço (eixo Z) com a wavelet — é isso que transforma os
     # "espinhos" de refletividade nas ondulações típicas de seção sísmica.
-    wavelet = _ricker_wavelet(length=15, freq=0.12)
+    wavelet = _ricker_wavelet(length=17, freq=0.11)
     volume = np.apply_along_axis(
         lambda trace: np.convolve(trace, wavelet, mode="same"), axis=0, arr=reflectivity
     )
+
+    if channel:
+        # Corpo de canal sinuoso (ex: arenito de canal) atravessando o volume
+        # numa profundidade média — um "alvo" geológico isolado no meio das
+        # camadas, não só refletores planos.
+        z_idx = np.arange(depth).reshape(depth, 1, 1)
+        channel_center = 0.5 * height + 0.16 * height * np.sin(2 * np.pi * 1.4 * xn)
+        channel_depth = 0.45 * depth + 0.05 * depth * np.sin(2 * np.pi * 2.2 * xn + 1.0)
+        channel_half_width = 0.05 * height
+        dist_from_center = np.abs(y_idx - channel_center)
+        in_channel = (dist_from_center < channel_half_width) & (
+            np.abs(z_idx - channel_depth) < 0.03 * depth
+        )
+        volume = np.where(in_channel, volume + 0.7, volume)
+
+    # Ruído fraco pra não ficar sintético/limpo demais.
+    volume = volume + rng.normal(0.0, 0.02, volume.shape).astype(np.float32)
 
     volume -= volume.min()
     max_value = volume.max()
@@ -636,7 +679,7 @@ def main():
     container = QWidget.createWindowContainer(render_window, main_win)
     main_win.setCentralWidget(container)
 
-    volume_dim = 64
+    volume_dim = 128
     volume_data = build_synthetic_volume(volume_dim, volume_dim, volume_dim, pattern=VOLUME_PATTERN)
     colormap_lut = build_colormap_lut(COLORMAP_NAME)
     clim = (0.0, 1.0)  # bate com a faixa de valores do volume sintético
