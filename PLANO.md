@@ -682,6 +682,32 @@ de testar interação com modificador (Ctrl+clique) é construir um `QMouseEvent
 chamar os handlers — a automação de mouse via Win32 (`mouse_event`/`keybd_event`) não entrega o
 modificador Ctrl de forma confiável ao Qt (achado da Fase 4, ver acima).
 
+### Colorbar nativa (GPU, substitui o `ColorbarWidget` Qt)
+
+Hoje a colorbar é um `ColorbarWidget` em Qt puro (`QPainter`), fora do Nebula — ver nota em
+"Overlays HUD" abaixo. Fazia sentido enquanto o Nebula não tinha texto próprio; agora que o
+texto GPU nativo existe (Fase 4, `add_text_label`/fonte bitmap embutida), a colorbar pode virar
+um overlay renderizado pelo próprio Nebula, eliminando o widget Qt separado e a necessidade de
+sincronizar manualmente cor/clim entre os dois lados a cada mudança.
+
+- **Geometria**: um quad simples em espaço de tela (NDC fixo, não gira com a câmera — mesmo
+  espírito dos overlays HUD, não faz parte da cena 3D), shader novo e pequeno (`colorbar.wgsl`),
+  sem luz, `TriangleList` de 2 triângulos.
+- **Cor**: sampleia a mesma textura 1D de colormap (`@group(2)`, já existe desde a Fase 3.7) que
+  o volume ativo usa — LUT `(N,4)` e `clim` idênticos, então nunca dessincroniza do volume: trocar
+  colormap/clim do volume (`set_volume_colormap`/`set_volume_clim`) já reflete na colorbar de
+  graça, sem replotar nada (mesma vantagem que motivou a versão Qt atual sobre o raster matplotlib
+  do VisPy, só que agora sem sair do processo de render).
+- **Labels de valor** (min/max e alguns ticks intermediários do `clim`): reaproveita
+  `add_text_label` direto — sem peça nova, já é GPU nativo desde a Fase 4.
+- **API**: `set_colorbar(volume_id, x, y, width, height)` (posição/tamanho em NDC ou frações de
+  tela) + `set_colorbar_visible(bool)`. Vincula a colorbar a um `volume_id` específico (para cenas
+  multi-volume, cada volume pode ter a sua, ou só a do volume "ativo" em foco — decidir na
+  implementação conforme o que o Andromeda realmente precisa exibir).
+- **Fora de escopo por ora**: colorbar discreta com blocos de cor nomeados (útil pra fácies
+  categóricas) — a Fase 4 já tem `discrete` no colormap, mas o layout de labels por bloco é
+  trabalho à parte; fazer a versão contínua primeiro e avaliar depois.
+
 ### Fora de escopo da Fase 5 (decisões já tomadas, não revisitar sem motivo novo)
 
 - LUT categórica de poço/log — fica no LogPlot Vision (VisPy), Nebula não trata disso.
@@ -735,9 +761,9 @@ Itens já resolvidos marcados com a fase que fechou eles; o resto é a Fase 5/6 
 ### Overlays HUD (tela fixa, não fazem parte da geometria 3D do mundo)
 - Bússola de norte e indicador de eixo XYZ, sincronizados manualmente com a rotação da câmera —
   ainda não implementado.
-- ~~Colorbar~~ — **feito (Fase 4)**: `ColorbarWidget` em Qt puro (`QPainter`), gradiente do
-  mesmo LUT `(N,4)` já usado pelo Nebula, sem replotar nada a cada mudança de cmap/clim (ao
-  contrário do raster matplotlib do VisPy atual).
+- Colorbar — **feito em Qt na Fase 4** (`ColorbarWidget`, `QPainter`, gradiente do mesmo LUT
+  `(N,4)` já usado pelo Nebula); **planejada migração pra GPU nativa na Fase 5** agora que o
+  texto GPU nativo existe, ver "Colorbar nativa (GPU)" acima.
 
 ### Sistema de coordenadas (precisa ser portado fielmente)
 - Array de volume: shape `(n_inline, n_xline, n_samples)`.

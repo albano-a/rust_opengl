@@ -52,7 +52,7 @@ AXIS_INDEX = {name: i for i, name in enumerate(AXIS_NAMES)}
 # Andromeda). Qualquer colormap "contínuo" do matplotlib funciona; LUTs
 # categóricas (ex: facies) são um caso à parte, resolvido no lado VisPy do
 # LogPlot Vision, não aqui.
-COLORMAP_NAME = "viridis"
+COLORMAP_NAME = "seismic"
 
 # "seismic": refletores sintéticos (parece sísmica de verdade).
 # "checker": mostra a variação de cor do colormap (útil pra validar a paleta).
@@ -119,7 +119,11 @@ def build_seismic_volume(
     # profundidade — criando as descontinuidades em degrau típicas de uma
     # seção real, que um empilhado de camadas paralelas nunca mostra.
     faults = [
-        (rng.uniform(0.2, 0.8), rng.uniform(-0.3, 0.3), int(rng.integers(3, 10)) * int(rng.choice([-1, 1])))
+        (
+            rng.uniform(0.2, 0.8),
+            rng.uniform(-0.3, 0.3),
+            int(rng.integers(3, 10)) * int(rng.choice([-1, 1])),
+        )
         for _ in range(n_faults)
     ]
 
@@ -397,7 +401,9 @@ class NebulaWindow(QWindow):
         if renderer is not None and volume_id in self._volume_ids_added:
             # Volume já existe no Rust — aplica na hora (ex: usuário ajustou
             # o posicionamento depois que tudo já estava carregado).
-            renderer.set_volume_placement(volume_id, *self._volume_placements[volume_id])
+            renderer.set_volume_placement(
+                volume_id, *self._volume_placements[volume_id]
+            )
             self._volume_placements_sent.add(volume_id)
         else:
             # Renderer não existe ainda, ou o volume correspondente ainda não
@@ -415,7 +421,16 @@ class NebulaWindow(QWindow):
         self._pending_axis_grid = (width, height, depth)
         self._axis_grid_added = False
 
-    def add_text_label(self, label_id, x: float, y: float, z: float, text: str, color=(0.5, 0.83, 1.0), scale: float = 0.12):
+    def add_text_label(
+        self,
+        label_id,
+        x: float,
+        y: float,
+        z: float,
+        text: str,
+        color=(0.5, 0.83, 1.0),
+        scale: float = 0.12,
+    ):
         """Label de texto GPU nativo (billboard 3D, fonte bitmap embutida no
         Nebula) — nada de widget Qt sobreposto: fica de verdade no espaço 3D,
         acompanha orbit/pan/zoom sozinho, sem precisar recalcular posição de
@@ -437,7 +452,9 @@ class NebulaWindow(QWindow):
             return None
         if self._renderer is None:
             hwnd = int(self.winId())
-            self._renderer = nebula.Renderer(hwnd, max(self.width(), 1), max(self.height(), 1), self._mode)
+            self._renderer = nebula.Renderer(
+                hwnd, max(self.width(), 1), max(self.height(), 1), self._mode
+            )
         return self._renderer
 
     def resizeEvent(self, event):
@@ -462,7 +479,10 @@ class NebulaWindow(QWindow):
             self._volume_ids_added.add(0)
 
         for volume_id, placement in self._volume_placements.items():
-            if volume_id in self._volume_ids_added and volume_id not in self._volume_placements_sent:
+            if (
+                volume_id in self._volume_ids_added
+                and volume_id not in self._volume_placements_sent
+            ):
                 renderer.set_volume_placement(volume_id, *placement)
                 self._volume_placements_sent.add(volume_id)
 
@@ -506,7 +526,9 @@ class NebulaWindow(QWindow):
                 # Ctrl+clique não precisa da combobox: descobre embaixo de
                 # qual fatia o cursor está de verdade, na cena.
                 pos = event.pos()
-                self._ctrl_drag_slice_id = renderer.pick_slice(float(pos.x()), float(pos.y()))
+                self._ctrl_drag_slice_id = renderer.pick_slice(
+                    float(pos.x()), float(pos.y())
+                )
 
     def mouseReleaseEvent(self, event):
         self._drag_button = None
@@ -550,7 +572,9 @@ class NebulaWindow(QWindow):
                 # Visão 2D: a fatia aparece de frente, então "mover ao longo
                 # do eixo" é ir pra dentro/fora da tela — não existe direção
                 # de arrasto pra projetar, então usa dy direto.
-                new_index = min(1.0, max(0.0, self._slices[target_slice_id][1] + dy * 0.002))
+                new_index = min(
+                    1.0, max(0.0, self._slices[target_slice_id][1] + dy * 0.002)
+                )
                 renderer.set_slice_axis_index(target_slice_id, axis, new_index)
             self._slices[target_slice_id] = (axis, new_index)
             if self.on_slice_changed is not None:
@@ -605,7 +629,9 @@ class ColorbarWidget(QWidget):
         rect = self.rect()
         bar_width = 24
         margin = 10
-        bar_rect = rect.adjusted(margin, margin, -(rect.width() - bar_width - margin), -margin)
+        bar_rect = rect.adjusted(
+            margin, margin, -(rect.width() - bar_width - margin), -margin
+        )
 
         n = len(self._lut)
         gradient = QLinearGradient(0, bar_rect.top(), 0, bar_rect.bottom())
@@ -692,12 +718,16 @@ class Slice2DDialog(QDialog):
         # com proporção 1:1 em vez da proporção real dos dados (`cube_scale`
         # afeta a fatia igual afeta o wireframe, mesmo em modo panzoom).
         self._render_window.set_survey_extent(volume_width, volume_height, volume_depth)
-        self._render_window.set_volume(volume_width, volume_height, volume_depth, volume_data)
+        self._render_window.set_volume(
+            volume_width, volume_height, volume_depth, volume_data
+        )
         self._render_window.set_colormap(colormap_lut)
         self._render_window.set_clim(*clim)
         # O diálogo 2D mostra uma fatia por vez (a que o combobox escolher) —
         # diferente do cubo 3D, que mostra as três ao mesmo tempo.
-        self._render_window.configure_slices({0: (AXIS_INDEX["Time"], 0.5)}, active_slice_id=0)
+        self._render_window.configure_slices(
+            {0: (AXIS_INDEX["Time"], 0.5)}, active_slice_id=0
+        )
 
         self._axis_combo.currentTextChanged.connect(self._on_axis_changed)
         self._position_slider.valueChanged.connect(self._on_position_changed)
@@ -726,7 +756,9 @@ class Slice2DDialog(QDialog):
         self._axis_combo.setCurrentText(AXIS_NAMES[axis])
         self._axis_combo.blockSignals(False)
         self._position_slider.blockSignals(True)
-        self._position_slider.setValue(int(round(index * self._position_slider.maximum())))
+        self._position_slider.setValue(
+            int(round(index * self._position_slider.maximum()))
+        )
         self._position_slider.blockSignals(False)
 
     def closeEvent(self, event):
@@ -763,7 +795,9 @@ def build_object_tree() -> QTreeWidget:
     return tree
 
 
-def build_slices_toolbar(main_win: QMainWindow, render_window: "NebulaWindow", open_2d_callback) -> QToolBar:
+def build_slices_toolbar(
+    main_win: QMainWindow, render_window: "NebulaWindow", open_2d_callback
+) -> QToolBar:
     """Réplica da slicesToolBar do Andromeda — e do jeito certo (Fase 4,
     corrigido): a combobox só *seleciona qual* das três fatias (Inline/
     Crossline/Time, sempre as três visíveis ao mesmo tempo no cubo) vai ser
@@ -795,7 +829,9 @@ def build_slices_toolbar(main_win: QMainWindow, render_window: "NebulaWindow", o
     opacity_slider.setMaximum(100)
     opacity_slider.setValue(100)
     opacity_slider.setMaximumWidth(120)
-    opacity_slider.valueChanged.connect(lambda v: render_window.set_volume_opacity(v / 100.0))
+    opacity_slider.valueChanged.connect(
+        lambda v: render_window.set_volume_opacity(v / 100.0)
+    )
     toolbar.addWidget(opacity_slider)
 
     toolbar.addSeparator()
@@ -836,7 +872,9 @@ def main():
     volume_width = 250
     volume_height = 350
     volume_depth = 100
-    volume_data = build_synthetic_volume(volume_width, volume_height, volume_depth, pattern=VOLUME_PATTERN)
+    volume_data = build_synthetic_volume(
+        volume_width, volume_height, volume_depth, pattern=VOLUME_PATTERN
+    )
     colormap_lut = build_colormap_lut(COLORMAP_NAME)
     clim = (0.0, 1.0)  # bate com a faixa de valores do volume sintético
 
@@ -877,13 +915,21 @@ def main():
     def open_2d_dialog():
         if dialog_2d["instance"] is None:
             dialog_2d["instance"] = Slice2DDialog(
-                main_win, volume_width, volume_height, volume_depth, volume_data, colormap_lut, clim
+                main_win,
+                volume_width,
+                volume_height,
+                volume_depth,
+                volume_data,
+                colormap_lut,
+                clim,
             )
         dialog_2d["instance"].show()
         dialog_2d["instance"].raise_()
         dialog_2d["instance"].activateWindow()
 
-    main_win.addToolBar(Qt.TopToolBarArea, build_slices_toolbar(main_win, render_window, open_2d_dialog))
+    main_win.addToolBar(
+        Qt.TopToolBarArea, build_slices_toolbar(main_win, render_window, open_2d_dialog)
+    )
 
     status_bar = main_win.statusBar()
     fps_state = {"last_time": time.perf_counter(), "frames": 0}

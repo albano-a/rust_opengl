@@ -7,12 +7,12 @@ use glam::Vec3;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
+use super::spatial::axis_grid_point;
+use super::uniforms::TextParamsUniform;
 use crate::gpu::camera::CameraKind;
 use crate::gpu::geometry::LineVertex;
 use crate::gpu::text::build_text_mesh;
 use crate::renderer::Renderer;
-use super::spatial::axis_grid_point;
-use super::uniforms::TextParamsUniform;
 
 // Tamanho dos labels do grid de eixo (INLINE/CROSSLINE/TIME + valores dos
 // ticks) — dois lugares únicos pra ajustar, em vez de mexer em cada chamada
@@ -21,9 +21,18 @@ use super::uniforms::TextParamsUniform;
 const AXIS_TICK_TEXT_SCALE: f32 = 0.02;
 const AXIS_CAPTION_TEXT_SCALE: f32 = 0.03;
 
-const AXIS_INLINE_COLOR: (f32, f32, f32) = (220. / 255., 80. / 255., 80. / 255.); // #dc5050
-const AXIS_XLINE_COLOR: (f32, f32, f32) = (80. / 255., 200. / 255., 120. / 255.); // #50c878
-const AXIS_Z_COLOR: (f32, f32, f32) = (80. / 255., 140. / 255., 220. / 255.); // #508cdc
+/// Converts a hex color to rgb
+const fn hex_rgb(hex: u32) -> (f32, f32, f32) {
+    (
+        ((hex >> 16) & 0xFF) as f32 / 255.0,
+        ((hex >> 8) & 0xFF) as f32 / 255.0,
+        (hex & 0xFF) as f32 / 255.0,
+    )
+}
+
+const AXIS_INLINE_COLOR: (f32, f32, f32) = hex_rgb(0xdc5050);
+const AXIS_XLINE_COLOR: (f32, f32, f32) = hex_rgb(0x50c878);
+const AXIS_Z_COLOR: (f32, f32, f32) = hex_rgb(0x508cdc);
 
 // Quantos ticks por eixo (incluindo os dois extremos).
 pub(crate) const AXIS_TICK_COUNT: u32 = 10;
