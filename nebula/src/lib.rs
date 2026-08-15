@@ -1,14 +1,17 @@
 mod camera;
 mod geometry;
+mod volume;
 
 use std::num::NonZeroIsize;
 
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle};
 
 use camera::OrbitCamera;
-use geometry::{Vertex, CUBE_INDICES, CUBE_VERTICES};
+use geometry::{SliceVertex, SLICE_INDICES, SLICE_VERTICES};
+use volume::Volume3D;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -41,14 +44,20 @@ struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_indices: u32,
     depth_view: wgpu::TextureView,
+
     camera: OrbitCamera,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+
+    slice_pipeline: wgpu::RenderPipeline,
+    slice_vertex_buffer: wgpu::Buffer,
+    slice_index_buffer: wgpu::Buffer,
+    num_slice_indices: u32,
+
+    volume_bind_group_layout: wgpu::BindGroupLayout,
+    volume_filterable: bool,
+    volume: Option<Volume3D>,
 }
 
 #[pymethods]
@@ -84,9 +93,18 @@ impl Renderer {
         }))
         .map_err(|e| PyRuntimeError::new_err(format!("nenhum adapter wgpu disponível: {e}")))?;
 
+        // Nem todo adapter sabe fazer sampling linear de textura R32Float (a
+        // textura de volume). Detectamos aqui e propagamos pro Volume3D na hora
+        // de montar o sampler.
+        let volume_filterable = adapter.features().contains(wgpu::Features::FLOAT32_FILTERABLE);
+        let mut required_features = wgpu::Features::empty();
+        if volume_filterable {
+            required_features |= wgpu::Features::FLOAT32_FILTERABLE;
+        }
+
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -145,28 +163,57 @@ impl Renderer {
             }],
         });
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        let volume_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("volume_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float {
+                                filterable: volume_filterable,
+                            },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(if volume_filterable {
+                            wgpu::SamplerBindingType::Filtering
+                        } else {
+                            wgpu::SamplerBindingType::NonFiltering
+                        }),
+                        count: None,
+                    },
+                ],
+            });
+
+        let slice_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("volume_slice_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("volume_slice.wgsl").into()),
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pipeline_layout"),
-            bind_group_layouts: &[Some(&camera_bind_group_layout)],
+        let slice_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("slice_pipeline_layout"),
+            bind_group_layouts: &[Some(&camera_bind_group_layout), Some(&volume_bind_group_layout)],
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("cube_pipeline"),
-            layout: Some(&pipeline_layout),
+        let slice_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("slice_pipeline"),
+            layout: Some(&slice_pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &slice_shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Some(Vertex::layout())],
+                buffers: &[Some(SliceVertex::layout())],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: &slice_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
@@ -188,20 +235,20 @@ impl Renderer {
             cache: None,
         });
 
-        let vertex_buffer = wgpu::util::DeviceExt::create_buffer_init(
+        let slice_vertex_buffer = wgpu::util::DeviceExt::create_buffer_init(
             &device,
             &wgpu::util::BufferInitDescriptor {
-                label: Some("vertex_buffer"),
-                contents: bytemuck::cast_slice(&CUBE_VERTICES),
+                label: Some("slice_vertex_buffer"),
+                contents: bytemuck::cast_slice(&SLICE_VERTICES),
                 usage: wgpu::BufferUsages::VERTEX,
             },
         );
 
-        let index_buffer = wgpu::util::DeviceExt::create_buffer_init(
+        let slice_index_buffer = wgpu::util::DeviceExt::create_buffer_init(
             &device,
             &wgpu::util::BufferInitDescriptor {
-                label: Some("index_buffer"),
-                contents: bytemuck::cast_slice(&CUBE_INDICES),
+                label: Some("slice_index_buffer"),
+                contents: bytemuck::cast_slice(&SLICE_INDICES),
                 usage: wgpu::BufferUsages::INDEX,
             },
         );
@@ -211,14 +258,17 @@ impl Renderer {
             device,
             queue,
             config,
-            pipeline,
-            vertex_buffer,
-            index_buffer,
-            num_indices: CUBE_INDICES.len() as u32,
             depth_view,
             camera,
             camera_buffer,
             camera_bind_group,
+            slice_pipeline,
+            slice_vertex_buffer,
+            slice_index_buffer,
+            num_slice_indices: SLICE_INDICES.len() as u32,
+            volume_bind_group_layout,
+            volume_filterable,
+            volume: None,
         })
     }
 
@@ -247,6 +297,34 @@ impl Renderer {
     /// Botão direito arrastando (ou scroll): aproxima/afasta a câmera.
     fn zoom(&mut self, delta: f32) {
         self.camera.zoom(delta);
+    }
+
+    /// Envia um volume escalar (ex: amplitude sísmica) pra GPU como textura 3D.
+    /// `data` precisa suportar o protocolo de buffer do Python (ex: um array
+    /// numpy `float32` C-contíguo) com exatamente `width * height * depth`
+    /// elementos, na ordem (inline, xline, amostra).
+    fn load_volume(&mut self, width: u32, height: u32, depth: u32, data: PyBuffer<f32>) -> PyResult<()> {
+        let expected = (width as usize) * (height as usize) * (depth as usize);
+        if data.item_count() != expected {
+            return Err(PyRuntimeError::new_err(format!(
+                "esperava {expected} elementos ({width}x{height}x{depth}), recebi {}",
+                data.item_count()
+            )));
+        }
+
+        let values = Python::attach(|py| data.to_vec(py))
+            .map_err(|e| PyRuntimeError::new_err(format!("falha ao ler o buffer: {e}")))?;
+
+        self.volume = Some(Volume3D::upload(
+            &self.device,
+            &self.queue,
+            &self.volume_bind_group_layout,
+            (width, height, depth),
+            self.volume_filterable,
+            &values,
+        ));
+
+        Ok(())
     }
 
     fn render(&mut self) -> PyResult<()> {
@@ -313,11 +391,17 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            render_pass.set_pipeline(&self.pipeline);
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            // Enquanto nenhum volume foi carregado (load_volume ainda não chamado),
+            // só limpamos a tela — não há bind group de textura pra desenhar.
+            if let Some(volume) = &self.volume {
+                render_pass.set_pipeline(&self.slice_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &volume.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.slice_vertex_buffer.slice(..));
+                render_pass
+                    .set_index_buffer(self.slice_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.draw_indexed(0..self.num_slice_indices, 0, 0..1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

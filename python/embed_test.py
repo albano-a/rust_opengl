@@ -1,6 +1,7 @@
-"""Protótipo de embedding (Fase 1) + câmera orbital (Fase 2): cubo renderizado via
-wgpu (módulo `nebula`), embutido numa QWindow do PyQt5 através de
-createWindowContainer, com câmera controlada por mouse.
+"""Protótipo de embedding (Fase 1) + câmera orbital (Fase 2) + textura de volume
+(Fase 3): uma fatia de um volume 3D sintético, renderizada via wgpu (módulo
+`nebula`), embutida numa QWindow do PyQt5 através de createWindowContainer,
+com câmera controlada por mouse.
 
 Controles (mesma convenção do MiddlePanTurntableCamera do VisPy no Andromeda):
     botão esquerdo arrastando  -> orbit (gira em torno do alvo)
@@ -18,6 +19,7 @@ Rodar de dentro de nebula/.venv (com `nebula` instalado via `maturin develop`):
 import sys
 import time
 
+import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QWindow
 from PyQt5.QtWidgets import (
@@ -33,6 +35,28 @@ from PyQt5.QtWidgets import (
 )
 
 import nebula
+
+
+def build_synthetic_volume(width=64, height=64, depth=64):
+    """Volume escalar sintético (gradiente + xadrez 3D) só pra provar o caminho
+    de upload Python -> textura 3D — sem ligação com dados sísmicos reais ainda.
+
+    Layout: array numpy C-contíguo de shape (depth, height, width), que é
+    exatamente a ordem de bytes que `Renderer.load_volume` espera (x/width é o
+    eixo que varia mais rápido na memória).
+    """
+    x = np.linspace(0.0, 1.0, width, dtype=np.float32)
+    y = np.linspace(0.0, 1.0, height, dtype=np.float32)
+    z = np.linspace(0.0, 1.0, depth, dtype=np.float32)
+    zz, yy, xx = np.meshgrid(z, y, x, indexing="ij")
+
+    gradient = xx
+    checker = (
+        (xx * 8).astype(np.int32) + (yy * 8).astype(np.int32) + (zz * 8).astype(np.int32)
+    ) % 2
+
+    volume = 0.5 * gradient + 0.5 * checker.astype(np.float32)
+    return np.ascontiguousarray(volume, dtype=np.float32)
 
 
 class MainWindow(QMainWindow):
@@ -66,6 +90,13 @@ class NebulaWindow(QWindow):
         self._closed = False
         self._drag_button = None
         self._last_pos = None
+        self._pending_volume = None
+
+    def set_volume(self, width: int, height: int, depth: int, data: np.ndarray):
+        # O Renderer só existe depois do primeiro resize real (winId() só é
+        # válido depois que a QWindow tem uma janela nativa por trás). Guardamos
+        # o volume e mandamos pro Rust assim que o Renderer estiver pronto.
+        self._pending_volume = (width, height, depth, data)
 
     def shutdown(self):
         # Chamado antes do Qt começar a destruir a janela nativa: depois disso,
@@ -89,8 +120,15 @@ class NebulaWindow(QWindow):
 
     def render_frame(self):
         renderer = self._ensure_renderer()
-        if renderer is not None:
-            renderer.render()
+        if renderer is None:
+            return
+
+        if self._pending_volume is not None:
+            width, height, depth, data = self._pending_volume
+            renderer.load_volume(width, height, depth, data)
+            self._pending_volume = None
+
+        renderer.render()
 
     def mousePressEvent(self, event):
         self._drag_button = event.button()
@@ -182,11 +220,15 @@ def main():
     timer = QTimer()
 
     main_win = MainWindow(render_window, timer)
-    main_win.setWindowTitle("Andromeda + Nebula (protótipo Fase 1)")
+    main_win.setWindowTitle("Andromeda + Nebula (protótipo Fase 3)")
     main_win.resize(1100, 700)
 
     container = QWidget.createWindowContainer(render_window, main_win)
     main_win.setCentralWidget(container)
+
+    volume_dim = 64
+    volume_data = build_synthetic_volume(volume_dim, volume_dim, volume_dim)
+    render_window.set_volume(volume_dim, volume_dim, volume_dim, volume_data)
 
     tree_dock = QDockWidget("Object Tree", main_win)
     tree_dock.setWidget(build_object_tree())
