@@ -12,5 +12,5 @@ raw-window-handle = "0.6"
 wgpu = "30.0.0"
 pollster = "1.0.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
-pyo3 = { version = "0.29.2", features = ["extension-module"] }
+pyo3 = { version = "0.29.2", features = ["extension-module", "multiple-pymethods"] }
 glam = { version = "0.33.3", features = ["bytemuck"] }
