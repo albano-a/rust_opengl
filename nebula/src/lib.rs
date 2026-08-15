@@ -13,14 +13,16 @@ use glam::{Mat4, Vec2, Vec3, Vec4};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use raw_window_handle::{RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle};
+use raw_window_handle::{
+    RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
+};
 
 use camera::{CameraKind, OrbitCamera, PanZoomCamera};
 use colormap::Colormap;
 use geometry::{
-    LineVertex, SliceVertex, SLICE_INDICES, SLICE_VERTICES, WIREFRAME_INDICES, WIREFRAME_VERTICES,
+    LineVertex, SLICE_INDICES, SLICE_VERTICES, SliceVertex, WIREFRAME_INDICES, WIREFRAME_VERTICES,
 };
-use text::{build_text_mesh, FontAtlas, TextVertex};
+use text::{FontAtlas, TextVertex, build_text_mesh};
 use volume::Volume3D;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -35,12 +37,15 @@ const VOLUME_FILTERABLE: bool = false;
 // ticks) — dois lugares únicos pra ajustar, em vez de mexer em cada chamada
 // de `insert_text_label` espalhada pelo `configure_axis_grid`. Unidade é a
 // mesma do cubo -1..1 (ver `TextParamsUniform`/`text.wgsl`).
-const AXIS_TICK_TEXT_SCALE: f32 = 0.05;
-const AXIS_CAPTION_TEXT_SCALE: f32 = 0.07;
+const AXIS_TICK_TEXT_SCALE: f32 = 0.02;
+const AXIS_CAPTION_TEXT_SCALE: f32 = 0.03;
 
+const AXIS_INLINE_COLOR: (f32, f32, f32) = (220. / 255., 80. / 255., 80. / 255.); // #dc5050
+const AXIS_XLINE_COLOR: (f32, f32, f32) = (80. / 255., 200. / 255., 120. / 255.); // #50c878
+const AXIS_Z_COLOR: (f32, f32, f32) = (80. / 255., 140. / 255., 220. / 255.); // #508cdc
 // Quantos ticks por eixo (incluindo os dois extremos) — 5 casa bem com o
 // cubo unitário (0%, 25%, 50%, 75%, 100%) sem lotar a tela de números.
-const AXIS_TICK_COUNT: u32 = 5;
+const AXIS_TICK_COUNT: u32 = 10;
 
 // Base dos ids internos dos labels do grid de eixo — bem longe de qualquer
 // id que o lado Python normalmente escolhe (slices, volumes, labels
@@ -91,7 +96,8 @@ struct TextParamsUniform {
 
 // Convenção espacial do cubo sísmico (cubo unitário -1..1 em cada eixo,
 // mesma caixa do wireframe em geometry.rs): mundo X = Inline, mundo Y =
-// Time (fatia rasa fica em cima), mundo Z = Crossline. `slice_move_axis`
+// Crossline, mundo Z = Time (fatia rasa fica em cima — Z é o eixo "pra
+// cima" da câmera, ver `OrbitCamera` em camera.rs, não Y). `slice_move_axis`
 // devolve a direção de translação de cada tipo de fatia; `slice_model_matrix`
 // gira o quad plano (que nasce na origem, no plano XY local) pra ficar
 // perpendicular ao eixo certo e o translada até a posição normalizada
@@ -101,8 +107,8 @@ struct TextParamsUniform {
 fn slice_move_axis(axis: u32) -> Vec3 {
     match axis {
         0 => Vec3::X, // Inline
-        2 => Vec3::Y, // Time
-        _ => Vec3::Z, // Crossline
+        1 => Vec3::Y, // Crossline
+        _ => Vec3::Z, // Time
     }
 }
 
@@ -110,41 +116,79 @@ fn slice_model_matrix(axis: u32, index: f32) -> Mat4 {
     let pos = index.clamp(0.0, 1.0) * 2.0 - 1.0;
     match axis {
         0 => {
-            // Inline fixo em X=pos; plano varre Crossline (Z) e Time (Y).
+            // Inline fixo em X=pos; plano varre Crossline (Y) e Time (Z).
             Mat4::from_translation(Vec3::new(pos, 0.0, 0.0))
-                * Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2)
+                * Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2)
         }
-        2 => {
-            // Time fixo em Y=pos; plano varre Inline (X) e Crossline (Z).
+        1 => {
+            // Crossline fixo em Y=pos; plano varre Inline (X) e Time (Z).
             Mat4::from_translation(Vec3::new(0.0, pos, 0.0))
-                * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2)
+                * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2)
         }
         _ => {
-            // Crossline fixo em Z=pos; plano varre Inline (X) e Time (Y) —
+            // Time fixo em Z=pos; plano varre Inline (X) e Crossline (Y) —
             // é o quad plano na sua orientação original, só transladado.
             Mat4::from_translation(Vec3::new(0.0, 0.0, pos))
         }
     }
 }
 
+/// Posiciona um volume DENTRO do cubo unitário -1..1 da survey. `origin`/
+/// `extent` são frações 0..1 do espaço normalizado da survey (não do
+/// próprio volume) — ex: um volume que começa na metade da survey e ocupa
+/// 30% dela num eixo tem origin=0.5, extent=0.3 nesse eixo. Aplicado ANTES
+/// de `slice_model_matrix` (que continua operando no espaço -1..1 local do
+/// próprio volume, sem saber nada sobre a survey): a fatia nasce no cubo
+/// local do volume, e essa matriz encolhe/translada esse cubo local pro
+/// pedaço certo do cubo da survey. Default origin=(0,0,0), extent=(1,1,1) é
+/// identidade (volume cobre a survey inteira, o caso mais comum: a sísmica
+/// principal) — reduz exatamente à conta antiga quando não há sub-região.
+fn volume_placement_matrix(origin: Vec3, extent: Vec3) -> Mat4 {
+    // Derivação: um ponto local p (-1..1) normaliza pra (p+1)/2 (0..1 no
+    // volume), passa pro espaço da survey como origin + normalizado*extent
+    // (0..1 na survey), e volta pra -1..1 multiplicando por 2 e subtraindo
+    // 1 — que simplifica pra escala `extent` + translação `origin*2-1+extent`.
+    let translation = origin * 2.0 - Vec3::ONE + extent;
+    Mat4::from_translation(translation) * Mat4::from_scale(extent)
+}
+
 /// Um volume carregado na GPU (textura 3D) junto com o colormap/clim usados
 /// pra colori-lo. Um `Renderer` pode ter vários, cada um com seu próprio id
 /// escolhido pelo lado Python (mesmo id que o Andromeda já usa pro dataset).
+///
+/// `origin`/`extent` posicionam esse volume DENTRO da survey (que tem seu
+/// próprio tamanho fixo, ver `Renderer::cube_scale`/`set_survey_extent`) —
+/// frações 0..1 do espaço normalizado da survey, não do volume. Default
+/// (0,0,0)/(1,1,1) = volume cobre a survey inteira (caso comum: a sísmica
+/// principal). Um volume menor (ex: inversão cobrindo só uma parte da área,
+/// ou um low-frequency model com sampling mais grosso) usa origin/extent
+/// menores que 1, igual o Andromeda já faz (`_positions_from_db` em
+/// `vispy_3D_visualization_controller.py`, offset+scale relativos à survey).
 struct VolumeEntry {
     volume: Volume3D,
     colormap: Colormap,
     clim: (f32, f32),
+    origin: Vec3,
+    extent: Vec3,
 }
 
 /// Uma fatia (AxisAlignedImage) de um volume específico: qual eixo (Inline/
-/// Crossline/Time) e em que posição normalizada. Vários slices podem apontar
-/// pro mesmo volume (ex: uma seção Inline e uma Crossline do mesmo dataset,
-/// visíveis ao mesmo tempo).
+/// Crossline/Time) e em que posição normalizada (0..1, relativa ao próprio
+/// volume, não à survey). Vários slices podem apontar pro mesmo volume (ex:
+/// uma seção Inline e uma Crossline do mesmo dataset, visíveis ao mesmo
+/// tempo).
+///
+/// `model` é o resultado já composto de `volume_placement_matrix(origin,
+/// extent) * slice_model_matrix(axis, index)` — recalculado sempre que o
+/// eixo/posição da fatia OU o posicionamento do volume mudam (ver
+/// `refresh_slice`), cacheado aqui pra `pick_slice` reusar sem duplicar a
+/// lógica de composição.
 struct SliceEntry {
     volume_id: u64,
     axis: u32,
     index: f32,
     visible: bool,
+    model: Mat4,
     params_buffer: wgpu::Buffer,
     params_bind_group: wgpu::BindGroup,
 }
@@ -169,7 +213,7 @@ struct TextLabelEntry {
 /// do volume) depende de pra onde a câmera está olhando agora.
 #[derive(Clone)]
 struct AxisGridConfig {
-    /// (label_id, axis [0=Inline/X, 1=Crossline/Z, 2=Time/Y], t 0..1 ao
+    /// (label_id, axis [0=Inline/X, 1=Crossline/Y, 2=Time/Z], t 0..1 ao
     /// longo da aresta).
     tick_ids: Vec<(u64, u32, f32)>,
     /// (label_id, axis) — nome do eixo, plantado no meio da aresta escolhida.
@@ -179,17 +223,23 @@ struct AxisGridConfig {
 /// Ponto num eixo do cubo, deslocado `out` unidades pra fora da caixa -1..1
 /// nas duas direções perpendiculares ao eixo `axis` — usado tanto pro ponto
 /// que fica exatamente na aresta (`out=1.0`) quanto pros pontos mais afastados
-/// (tick, texto do valor, nome do eixo). `back` são os sinais (±1) do lado do
-/// cubo escolhido como "de trás" da câmera pra cada um dos 3 eixos do mundo.
-fn axis_grid_point(axis: u32, local: f32, back: Vec3, out: f32) -> Vec3 {
+/// (tick, texto do valor, nome do eixo). `near_side` são os sinais (±1) do
+/// canto do cubo mais perto da câmera, escolhido pra cada um dos 3 eixos do
+/// mundo (ver `update_axis_grid` pro porquê de ser o canto próximo, não o
+/// distante).
+fn axis_grid_point(axis: u32, local: f32, near_side: Vec3, out: f32) -> Vec3 {
     match axis {
-        0 => Vec3::new(local, back.y * out, back.z * out), // Inline varia em X
-        1 => Vec3::new(back.x * out, back.y * out, local), // Crossline varia em Z
-        _ => Vec3::new(back.x * out, local, back.z * out), // Time varia em Y
+        0 => Vec3::new(local, near_side.y * out, near_side.z * out), // Inline varia em X
+        1 => Vec3::new(near_side.x * out, local, near_side.z * out), // Crossline varia em Y
+        _ => Vec3::new(near_side.x * out, near_side.y * out, local), // Time varia em Z
     }
 }
 
-fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+fn create_depth_view(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+    sample_count: u32,
+) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth_texture"),
         size: wgpu::Extent3d {
@@ -198,13 +248,65 @@ fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration)
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Maior sample count de MSAA que tanto o formato de cor da surface quanto o
+/// formato de profundidade suportam ao mesmo tempo (os dois precisam bater
+/// no mesmo render pass) — tentado em ordem decrescente a partir de 8x
+/// (pedido explícito do usuário: "8x é melhor"), caindo pra 4x/2x/1x se o
+/// adapter não suportar. `1` = sem MSAA (nunca falha: todo adapter suporta
+/// sample count 1).
+fn best_common_sample_count(
+    adapter: &wgpu::Adapter,
+    color_format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
+) -> u32 {
+    let color_features = adapter.get_texture_format_features(color_format);
+    let depth_features = adapter.get_texture_format_features(depth_format);
+    for &count in &[8u32, 4, 2, 1] {
+        if color_features.flags.sample_count_supported(count)
+            && depth_features.flags.sample_count_supported(count)
+        {
+            return count;
+        }
+    }
+    1
+}
+
+/// Textura de cor multisampled onde a cena é desenhada de verdade — resolvida
+/// (`resolve_target`) na textura de 1 sample da swapchain no fim do render
+/// pass. `None` quando `sample_count <= 1` (MSAA indisponível/desligado):
+/// nesse caso a cena desenha direto na swapchain, sem esse passo extra.
+fn create_msaa_color_view(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+    sample_count: u32,
+) -> Option<wgpu::TextureView> {
+    if sample_count <= 1 {
+        return None;
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("msaa_color_texture"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    Some(texture.create_view(&wgpu::TextureViewDescriptor::default()))
 }
 
 /// Motor de renderização Nebula, embutido num HWND emprestado de um host nativo
@@ -219,10 +321,28 @@ struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
+    // Quantos samples de MSAA o adapter realmente suporta pros formatos de
+    // cor/profundidade em uso (ver `best_common_sample_count`) — 1 = sem
+    // MSAA. Todos os pipelines são criados com esse valor fixo (não dá pra
+    // mudar depois sem recriar tudo, então é decidido uma vez em `new`).
+    sample_count: u32,
+    // `None` quando `sample_count == 1` — nesse caso a cena desenha direto
+    // na textura da swapchain, sem essa textura intermediária.
+    msaa_color_view: Option<wgpu::TextureView>,
 
     camera: CameraKind,
     scene_buffer: wgpu::Buffer,
     scene_bind_group: wgpu::BindGroup,
+    // Escala não-uniforme aplicada a toda a cena (`SceneUniform::model`) pra
+    // o cubo virar um paralelepípedo de verdade quando o volume não é
+    // equidimensional (ex: 250 inlines x 350 crosslines x 100 amostras) —
+    // sem isso, tudo era forçado num cubo -1..1 mesmo quando os eixos têm
+    // extensões bem diferentes. Normalizada pelo maior eixo (o maior lado
+    // fica em 1.0, os outros encolhem proporcionalmente), atualizada em
+    // `add_volume`. Usada tanto no shader quanto localmente em `pick_slice`/
+    // `nudge_slice`/`project_to_screen`, que precisam do mesmo espaço que a
+    // GPU realmente desenha.
+    cube_scale: Vec3,
 
     slice_pipeline: wgpu::RenderPipeline,
     slice_vertex_buffer: wgpu::Buffer,
@@ -288,9 +408,20 @@ impl Renderer {
         }))
         .map_err(|e| PyRuntimeError::new_err(format!("nenhum adapter wgpu disponível: {e}")))?;
 
+        // Sem essa feature, o wgpu só garante os sample counts do spec da
+        // WebGPU ([1,4]) mesmo em adapters cujo hardware suporta mais (8x,
+        // por exemplo) — `adapter.get_texture_format_features` (usado em
+        // `best_common_sample_count`) já reflete a capacidade real do
+        // hardware, mas só vira válido de verdade se essa feature for pedida
+        // aqui. `& adapter.features()` pra nunca pedir algo que o adapter
+        // não tem (adapter mais antigo/software cai de volta pro [1,4] do
+        // spec, sem quebrar).
+        let required_features =
+            wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES & adapter.features();
+
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: wgpu::Limits::default(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -312,7 +443,9 @@ impl Renderer {
         let surface_format = config.format;
         surface.configure(&device, &config);
 
-        let depth_view = create_depth_view(&device, &config);
+        let sample_count = best_common_sample_count(&adapter, surface_format, DEPTH_FORMAT);
+        let depth_view = create_depth_view(&device, &config, sample_count);
+        let msaa_color_view = create_msaa_color_view(&device, &config, sample_count);
 
         let aspect = config.width as f32 / config.height as f32;
         let camera = match mode.as_str() {
@@ -453,16 +586,17 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(include_str!("volume_slice.wgsl").into()),
         });
 
-        let slice_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("slice_pipeline_layout"),
-            bind_group_layouts: &[
-                Some(&scene_bind_group_layout),
-                Some(&volume_bind_group_layout),
-                Some(&colormap_bind_group_layout),
-                Some(&slice_params_bind_group_layout),
-            ],
-            immediate_size: 0,
-        });
+        let slice_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("slice_pipeline_layout"),
+                bind_group_layouts: &[
+                    Some(&scene_bind_group_layout),
+                    Some(&volume_bind_group_layout),
+                    Some(&colormap_bind_group_layout),
+                    Some(&slice_params_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
 
         let slice_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("slice_pipeline"),
@@ -495,7 +629,11 @@ impl Renderer {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             multiview_mask: None,
             cache: None,
         });
@@ -570,7 +708,11 @@ impl Renderer {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             multiview_mask: None,
             cache: None,
         });
@@ -671,18 +813,28 @@ impl Renderer {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState::default(),
-            // Texto é anotação tipo HUD (igual o Petrel deixa os labels de
-            // eixo sempre legíveis) — sempre visível por cima de tudo, não
-            // ocluído pela geometria 3D. Sem escrever profundidade, pra não
-            // atrapalhar nada desenhado depois.
+            // O grid (wireframe + labels/ticks) é um objeto de verdade na
+            // cena, não um HUD — se um volume estiver na frente da câmera em
+            // relação a um label (ex: CROSSLINE visto atrás de uma fatia
+            // opaca), o label tem que ficar escondido atrás dela, igual
+            // qualquer geometria normal ficaria. `depth_compare: Less` (não
+            // `Always`) faz o texto respeitar o que as fatias já escreveram
+            // no depth buffer — mesmo tratamento que o `wireframe_pipeline`
+            // já usa. Sem escrever profundidade (só um label não deveria
+            // ocluir outro atrás dele por causa de um pixel transparente do
+            // glifo).
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             multiview_mask: None,
             cache: None,
         });
@@ -703,9 +855,12 @@ impl Renderer {
             queue,
             config,
             depth_view,
+            sample_count,
+            msaa_color_view,
             camera,
             scene_buffer,
             scene_bind_group,
+            cube_scale: Vec3::ONE,
             slice_pipeline,
             slice_vertex_buffer,
             slice_index_buffer,
@@ -737,7 +892,9 @@ impl Renderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        self.depth_view = create_depth_view(&self.device, &self.config);
+        self.depth_view = create_depth_view(&self.device, &self.config, self.sample_count);
+        self.msaa_color_view =
+            create_msaa_color_view(&self.device, &self.config, self.sample_count);
         self.camera.set_aspect(width as f32 / height as f32);
     }
 
@@ -802,7 +959,22 @@ impl Renderer {
             false,
         );
 
-        self.volumes.insert(id, VolumeEntry { volume, colormap, clim });
+        // Default: volume cobre a survey inteira (origin=0, extent=1) — é o
+        // caso comum (a sísmica principal) e também o comportamento correto
+        // se `set_volume_placement` nunca for chamado. Volumes menores (ex:
+        // inversão cobrindo só parte da área) chamam `set_volume_placement`
+        // depois pra se posicionar dentro da survey.
+        self.volumes.insert(
+            id,
+            VolumeEntry {
+                volume,
+                colormap,
+                clim,
+                origin: Vec3::ZERO,
+                extent: Vec3::ONE,
+            },
+        );
+
         Ok(())
     }
 
@@ -810,6 +982,70 @@ impl Renderer {
     fn remove_volume(&mut self, id: u64) {
         self.volumes.remove(&id);
         self.slices.retain(|_, slice| slice.volume_id != id);
+    }
+
+    /// Define a extensão fixa da survey (em amostras: quantas inlines,
+    /// crosslines e amostras de tempo/profundidade ela cobre) — chamado uma
+    /// vez, na criação do projeto (mesmo momento em que o Andromeda grava a
+    /// `Survey` no banco), não a cada volume importado. Controla o formato
+    /// do wireframe/grid de eixo (`cube_scale`, o maior eixo vira a
+    /// referência "1.0", os outros encolhem proporcionalmente) — volumes
+    /// importados depois (sísmica, inversão, low-frequency model, fácies)
+    /// não mudam mais esse formato; eles se posicionam DENTRO dele via
+    /// `set_volume_placement`.
+    fn set_survey_extent(&mut self, width: u32, height: u32, depth: u32) {
+        let max_dim = width.max(height).max(depth).max(1) as f32;
+        self.cube_scale = Vec3::new(
+            width as f32 / max_dim,
+            height as f32 / max_dim,
+            depth as f32 / max_dim,
+        );
+    }
+
+    /// Posiciona o volume `id` dentro do cubo -1..1 da survey — pra quando
+    /// ele não cobre a survey inteira (ex: uma inversão que só cobre
+    /// inlines 500-800 de uma survey 0-1250, ou um low-frequency model
+    /// reamostrado mais grosso). `origin_*`/`extent_*` são frações 0..1 do
+    /// espaço da survey (não do próprio volume): origin é onde o volume
+    /// começa, extent é quanto dele ocupa. O lado Python calcula essas duas
+    /// frações a partir dos campos que o Andromeda já tem no banco (min/max/
+    /// sampling da survey vs. do volume — mesma conta de `_positions_from_db`
+    /// em `vispy_3D_visualization_controller.py`, só que expressa como
+    /// fração em vez de offset+escala em amostras). Sem chamar isso, o
+    /// volume assume que cobre a survey inteira (origin=0, extent=1).
+    #[allow(clippy::too_many_arguments)]
+    fn set_volume_placement(
+        &mut self,
+        id: u64,
+        origin_inline: f32,
+        origin_crossline: f32,
+        origin_time: f32,
+        extent_inline: f32,
+        extent_crossline: f32,
+        extent_time: f32,
+    ) -> PyResult<()> {
+        {
+            let entry = self
+                .volumes
+                .get_mut(&id)
+                .ok_or_else(|| PyRuntimeError::new_err(format!("volume {id} não encontrado")))?;
+            entry.origin = Vec3::new(origin_inline, origin_crossline, origin_time);
+            entry.extent = Vec3::new(extent_inline, extent_crossline, extent_time);
+        }
+
+        // Toda fatia já existente desse volume precisa recalcular sua
+        // posição — o posicionamento do volume mudou debaixo dela.
+        let affected: Vec<u64> = self
+            .slices
+            .iter()
+            .filter(|(_, slice)| slice.volume_id == id)
+            .map(|(&slice_id, _)| slice_id)
+            .collect();
+        for slice_id in affected {
+            self.refresh_slice(slice_id);
+        }
+
+        Ok(())
     }
 
     /// Define a paleta de cores usada pra mapear o valor amostrado do volume
@@ -883,7 +1119,7 @@ impl Renderer {
             )));
         }
 
-        let model = slice_model_matrix(axis, index);
+        let model = self.compute_slice_model(volume_id, axis, index);
         let params_buffer = wgpu::util::DeviceExt::create_buffer_init(
             &self.device,
             &wgpu::util::BufferInitDescriptor {
@@ -908,7 +1144,15 @@ impl Renderer {
 
         self.slices.insert(
             slice_id,
-            SliceEntry { volume_id, axis, index, visible: true, params_buffer, params_bind_group },
+            SliceEntry {
+                volume_id,
+                axis,
+                index,
+                visible: true,
+                model,
+                params_buffer,
+                params_bind_group,
+            },
         );
         Ok(())
     }
@@ -931,24 +1175,18 @@ impl Renderer {
     /// Andromeda vai chamar a cada movimento, sem recriar nada na GPU além
     /// de reescrever um uniform pequeno.
     fn set_slice_axis_index(&mut self, slice_id: u64, axis: u32, index: f32) -> PyResult<()> {
-        let slice = self
-            .slices
-            .get_mut(&slice_id)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("slice {slice_id} não encontrada")))?;
+        if !self.slices.contains_key(&slice_id) {
+            return Err(PyRuntimeError::new_err(format!(
+                "slice {slice_id} não encontrada"
+            )));
+        }
         let index = index.clamp(0.0, 1.0);
-        slice.axis = axis;
-        slice.index = index;
-        let model = slice_model_matrix(axis, index);
-        self.queue.write_buffer(
-            &slice.params_buffer,
-            0,
-            bytemuck::cast_slice(&[SliceParamsUniform {
-                model: model.to_cols_array_2d(),
-                axis,
-                index,
-                _pad: [0.0; 2],
-            }]),
-        );
+        {
+            let slice = self.slices.get_mut(&slice_id).unwrap();
+            slice.axis = axis;
+            slice.index = index;
+        }
+        self.refresh_slice(slice_id);
         Ok(())
     }
 
@@ -962,25 +1200,47 @@ impl Renderer {
     /// arrastar perpendicular a ele não faz quase nada. Devolve o novo
     /// `index` (0..1) pro lado Python manter slider/combobox sincronizados.
     fn nudge_slice(&mut self, slice_id: u64, screen_dx: f32, screen_dy: f32) -> PyResult<f32> {
-        let (axis, index) = {
-            let slice = self
-                .slices
-                .get(&slice_id)
-                .ok_or_else(|| PyRuntimeError::new_err(format!("slice {slice_id} não encontrada")))?;
-            (slice.axis, slice.index)
+        let (volume_id, axis, index, model) = {
+            let slice = self.slices.get(&slice_id).ok_or_else(|| {
+                PyRuntimeError::new_err(format!("slice {slice_id} não encontrada"))
+            })?;
+            (slice.volume_id, slice.axis, slice.index, slice.model)
         };
 
-        let move_axis = slice_move_axis(axis);
+        // `move_axis` precisa refletir quanto de espaço de mundo de verdade
+        // uma mudança de `index` realmente percorre: `cube_scale` (formato
+        // da survey) MULTIPLICADO pela `extent` do volume nesse eixo — um
+        // volume que só cobre 30% da survey num eixo (`set_volume_placement`)
+        // anda só 30% da distância por unidade de índice, comparado a um
+        // volume que cobre a survey inteira. `anchor` é a posição real da
+        // fatia agora (não presume origin=0 — a fatia pode estar no meio da
+        // survey se o volume dela começa lá).
+        let extent = self
+            .volumes
+            .get(&volume_id)
+            .map(|v| v.extent)
+            .unwrap_or(Vec3::ONE);
+        let axis_extent = match axis {
+            0 => extent.x,
+            1 => extent.y,
+            _ => extent.z,
+        };
+        let move_axis = slice_move_axis(axis) * self.cube_scale * axis_extent;
+        let cube_model = Mat4::from_scale(self.cube_scale) * model;
+        let anchor = (cube_model * Vec4::new(0.0, 0.0, 0.0, 1.0)).truncate();
         let view_proj = self.camera.view_proj();
-        let pos = move_axis * (index * 2.0 - 1.0);
         let eps = 0.05;
-        let a = view_proj * (pos - move_axis * eps).extend(1.0);
-        let b = view_proj * (pos + move_axis * eps).extend(1.0);
+        let a = view_proj * (anchor - move_axis * eps).extend(1.0);
+        let b = view_proj * (anchor + move_axis * eps).extend(1.0);
         let a_ndc = a.truncate() / a.w.abs().max(1e-4);
         let b_ndc = b.truncate() / b.w.abs().max(1e-4);
         // Tela: X igual à NDC, Y invertido (NDC +Y é pra cima, tela +Y é pra baixo).
         let raw_dir = Vec2::new(b_ndc.x - a_ndc.x, -(b_ndc.y - a_ndc.y));
-        let screen_dir = if raw_dir.length_squared() > 1e-6 { raw_dir.normalize() } else { Vec2::X };
+        let screen_dir = if raw_dir.length_squared() > 1e-6 {
+            raw_dir.normalize()
+        } else {
+            Vec2::X
+        };
 
         let along = screen_dx * screen_dir.x + screen_dy * screen_dir.y;
         let new_index = (index + along * 0.003).clamp(0.0, 1.0);
@@ -1018,8 +1278,15 @@ impl Renderer {
             if !slice.visible {
                 continue;
             }
-            let model = slice_model_matrix(slice.axis, slice.index);
-            let normal = (model * Vec4::new(0.0, 0.0, 1.0, 0.0)).truncate().normalize();
+            // `slice.model` já inclui o posicionamento do volume dentro da
+            // survey (`compute_slice_model`/`refresh_slice`) — só falta
+            // `cube_scale`, igualzinho ao shader (`scene.model * slice.model`,
+            // ver volume_slice.wgsl), senão o plano testado não bate com o
+            // que está desenhado de verdade.
+            let model = Mat4::from_scale(self.cube_scale) * slice.model;
+            let normal = (model * Vec4::new(0.0, 0.0, 1.0, 0.0))
+                .truncate()
+                .normalize();
             let point_on_plane = (model * Vec4::new(0.0, 0.0, 0.0, 1.0)).truncate();
 
             let denom = normal.dot(ray_dir);
@@ -1054,7 +1321,8 @@ impl Renderer {
     /// cabeça de poço na Fase 5) sem o Nebula precisar saber renderizar
     /// texto. Devolve `None` se o ponto está atrás da câmera.
     fn project_to_screen(&self, x: f32, y: f32, z: f32) -> Option<(f32, f32)> {
-        let clip = self.camera.view_proj() * Vec4::new(x, y, z, 1.0);
+        let world = Vec3::new(x, y, z) * self.cube_scale;
+        let clip = self.camera.view_proj() * Vec4::new(world.x, world.y, world.z, 1.0);
         if clip.w <= 1e-4 {
             return None;
         }
@@ -1112,7 +1380,8 @@ impl Renderer {
         // ela guardada à parte, então relemos não é possível sem um readback
         // da GPU; como só x/y/z mudam aqui, reescrevemos só os 3 primeiros
         // floats do uniform (offset 0), deixando `scale` (offset 12) intacto.
-        self.queue.write_buffer(&label.params_buffer, 0, bytemuck::cast_slice(&[x, y, z]));
+        self.queue
+            .write_buffer(&label.params_buffer, 0, bytemuck::cast_slice(&[x, y, z]));
         Ok(())
     }
 
@@ -1134,7 +1403,12 @@ impl Renderer {
             }
         }
 
-        const AXIS_NAMES: [&str; 3] = ["INLINE", "CROSSLINE", "TIME"];
+        const AXIS_NAMES: [&str; 3] = ["Inline", "Crossline", "Time"];
+        const AXIS_COLORS: [(f32, f32, f32); 3] = [
+            AXIS_INLINE_COLOR, // #dc5050
+            AXIS_XLINE_COLOR,  // #50c878
+            AXIS_Z_COLOR,      // #508cdc
+        ];
         let dims = [width.max(1), height.max(1), depth.max(1)];
 
         let mut tick_ids = Vec::new();
@@ -1148,7 +1422,7 @@ impl Renderer {
                 caption_id,
                 Vec3::ZERO,
                 AXIS_NAMES[axis as usize],
-                (0.55, 0.83, 1.0),
+                AXIS_COLORS[axis as usize],
                 AXIS_CAPTION_TEXT_SCALE,
             );
             caption_ids.push((caption_id, axis));
@@ -1158,20 +1432,27 @@ impl Renderer {
                 let raw_value = t * (dim - 1) as f32;
                 // Time é invertido: topo do cubo (t=1, Y=+1) é a amostra 0
                 // (mais rasa), fundo (t=0, Y=-1) é a última amostra.
-                let value = if axis == 2 { (dim - 1) as f32 - raw_value } else { raw_value };
+                let value = if axis == 2 {
+                    (dim - 1) as f32 - raw_value
+                } else {
+                    raw_value
+                };
                 let id = AXIS_GRID_ID_BASE + axis as u64 * 100 + i as u64;
                 self.insert_text_label(
                     id,
                     Vec3::ZERO,
                     &(value.round() as i64).to_string(),
-                    (0.75, 0.9, 1.0),
+                    AXIS_COLORS[axis as usize],
                     AXIS_TICK_TEXT_SCALE,
                 );
                 tick_ids.push((id, axis, t));
             }
         }
 
-        self.axis_grid = Some(AxisGridConfig { tick_ids, caption_ids });
+        self.axis_grid = Some(AxisGridConfig {
+            tick_ids,
+            caption_ids,
+        });
     }
 
     fn render(&mut self) -> PyResult<()> {
@@ -1200,7 +1481,7 @@ impl Renderer {
 
         let scene_uniform = SceneUniform {
             view_proj: self.camera.view_proj().to_cols_array_2d(),
-            model: Mat4::IDENTITY.to_cols_array_2d(),
+            model: Mat4::from_scale(self.cube_scale).to_cols_array_2d(),
             light_position: [eye.x, eye.y, eye.z, 0.0],
             camera_position: [eye.x, eye.y, eye.z, 0.0],
             flags: [self.camera.lighting_enabled(), 0.0, 0.0, 0.0],
@@ -1208,8 +1489,11 @@ impl Renderer {
             camera_up: [up.x, up.y, up.z, 0.0],
         };
 
-        self.queue
-            .write_buffer(&self.scene_buffer, 0, bytemuck::cast_slice(&[scene_uniform]));
+        self.queue.write_buffer(
+            &self.scene_buffer,
+            0,
+            bytemuck::cast_slice(&[scene_uniform]),
+        );
 
         self.update_axis_grid();
 
@@ -1223,21 +1507,32 @@ impl Renderer {
                 label: Some("render_encoder"),
             });
 
+        // Com MSAA (`sample_count > 1`), a cena é desenhada na textura
+        // multisampled (`msaa_color_view`) e resolvida (`resolve_target`) na
+        // textura de 1 sample da swapchain no fim do pass — não precisa
+        // `Store` o conteúdo multisampled em si, só o resultado resolvido.
+        // Sem MSAA (adapter não suporta nem 2x), desenha direto na swapchain,
+        // igual antes.
+        let (color_view, resolve_target, color_store) = match &self.msaa_color_view {
+            Some(msaa_view) => (msaa_view, Some(&view), wgpu::StoreOp::Discard),
+            None => (&view, None, wgpu::StoreOp::Store),
+        };
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    view: color_view,
+                    resolve_target,
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
                             a: 1.0,
                         }),
-                        store: wgpu::StoreOp::Store,
+                        store: color_store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -1258,7 +1553,8 @@ impl Renderer {
             render_pass.set_pipeline(&self.slice_pipeline);
             render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.slice_vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.slice_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass
+                .set_index_buffer(self.slice_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
 
             for slice in self.slices.values() {
                 if !slice.visible {
@@ -1279,8 +1575,10 @@ impl Renderer {
             render_pass.set_pipeline(&self.wireframe_pipeline);
             render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.wireframe_vertex_buffer.slice(..));
-            render_pass
-                .set_index_buffer(self.wireframe_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.set_index_buffer(
+                self.wireframe_index_buffer.slice(..),
+                wgpu::IndexFormat::Uint16,
+            );
             render_pass.draw_indexed(0..self.num_wireframe_indices, 0, 0..1);
 
             // Traços curtos de tick do grid de eixo — mesmo pipeline/bind
@@ -1303,7 +1601,8 @@ impl Renderer {
                     }
                     render_pass.set_bind_group(1, &label.params_bind_group, &[]);
                     render_pass.set_vertex_buffer(0, label.vertex_buffer.slice(..));
-                    render_pass.set_index_buffer(label.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                    render_pass
+                        .set_index_buffer(label.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                     render_pass.draw_indexed(0..label.num_indices, 0, 0..1);
                 }
             }
@@ -1322,7 +1621,14 @@ impl Renderer {
     /// pelo lado Python) quanto por `configure_axis_grid` (labels do grid de
     /// eixo, cuja posição inicial não importa porque `render()` recalcula a
     /// cada frame).
-    fn insert_text_label(&mut self, id: u64, pos: Vec3, text: &str, color: (f32, f32, f32), scale: f32) {
+    fn insert_text_label(
+        &mut self,
+        id: u64,
+        pos: Vec3,
+        text: &str,
+        color: (f32, f32, f32),
+        scale: f32,
+    ) {
         let (vertices, indices) = build_text_mesh(text);
 
         let vertex_buffer = wgpu::util::DeviceExt::create_buffer_init(
@@ -1357,7 +1663,10 @@ impl Renderer {
         let params_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("text_params_bind_group"),
             layout: &self.text_params_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() }],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params_buffer.as_entire_binding(),
+            }],
         });
 
         self.text_labels.insert(
@@ -1370,6 +1679,51 @@ impl Renderer {
                 params_bind_group,
                 visible: true,
             },
+        );
+    }
+
+    /// Matriz completa de uma fatia dentro do cubo -1..1 da SURVEY: primeiro
+    /// posiciona/orienta a fatia dentro do espaço local do seu próprio
+    /// volume (`slice_model_matrix`), depois encolhe/translada esse espaço
+    /// local pro pedaço certo do espaço da survey
+    /// (`volume_placement_matrix`, usando `origin`/`extent` do volume — ver
+    /// `set_volume_placement`). Volume não encontrado (não deveria
+    /// acontecer, `add_slice` já valida) cai no caso "cobre a survey
+    /// inteira" em vez de dar panic.
+    fn compute_slice_model(&self, volume_id: u64, axis: u32, index: f32) -> Mat4 {
+        let (origin, extent) = self
+            .volumes
+            .get(&volume_id)
+            .map(|v| (v.origin, v.extent))
+            .unwrap_or((Vec3::ZERO, Vec3::ONE));
+        volume_placement_matrix(origin, extent) * slice_model_matrix(axis, index)
+    }
+
+    /// Recalcula `model` de uma fatia (a partir do seu `axis`/`index`/
+    /// `volume_id` atuais) e reescreve só o uniform na GPU — chamado depois
+    /// de mudar o eixo/posição da própria fatia (`set_slice_axis_index`) ou
+    /// depois de reposicionar o volume dela dentro da survey
+    /// (`set_volume_placement`).
+    fn refresh_slice(&mut self, slice_id: u64) {
+        let Some((volume_id, axis, index)) = self
+            .slices
+            .get(&slice_id)
+            .map(|s| (s.volume_id, s.axis, s.index))
+        else {
+            return;
+        };
+        let model = self.compute_slice_model(volume_id, axis, index);
+        let slice = self.slices.get_mut(&slice_id).unwrap();
+        slice.model = model;
+        self.queue.write_buffer(
+            &slice.params_buffer,
+            0,
+            bytemuck::cast_slice(&[SliceParamsUniform {
+                model: model.to_cols_array_2d(),
+                axis,
+                index,
+                _pad: [0.0; 2],
+            }]),
         );
     }
 
@@ -1391,27 +1745,79 @@ impl Renderer {
             CameraKind::PanZoom(c) => c.target,
         };
         let dir = eye - target;
-        let dir = if dir.length_squared() > 1e-6 { dir.normalize() } else { Vec3::Z };
+        let dir = if dir.length_squared() > 1e-6 {
+            dir.normalize()
+        } else {
+            Vec3::Y
+        };
         let sgn = |v: f32| if v >= 0.0 { 1.0_f32 } else { -1.0_f32 };
-        // Lado do cubo escolhido pra cada eixo é o oposto de onde a câmera
-        // está — a aresta "de trás", que não atravessa o volume renderizado.
-        let back = Vec3::new(-sgn(dir.x), -sgn(dir.y), -sgn(dir.z));
+        // Em X/Y, o lado do cubo escolhido é o MESMO lado de onde a câmera
+        // está, não o oposto. Parece contra-intuitivo ("não devia ficar
+        // escondido atrás?"), mas o texto ignora o depth buffer de propósito
+        // (`depth_compare: Always`, ver text.wgsl) — ele desenha por cima de
+        // tudo, então a pergunta não é "o que está oculto", e sim "que canto
+        // do cubo projeta pra fora da silhueta na tela". O canto mais
+        // PRÓXIMO da câmera é sempre um vértice real da silhueta (é
+        // literalmente o ponto do cubo mais perto do observador, não tem
+        // como ficar "escondido atrás" da própria caixa) — o canto mais
+        // distante não tem essa garantia: em ângulos elevados/de esguelha, a
+        // projeção em perspectiva empurra o canto de trás pra dentro da
+        // silhueta, e como o texto ignora profundidade, ele acaba desenhado
+        // por cima das fatias sísmicas em vez de fora da caixa.
+        // Y: canto mais próximo da câmera, pelo motivo explicado acima —
+        // só usado pela aresta de Inline (fixa Y,Z) e de Time (fixa X,Y).
+        // Z (qual dos dois "anéis" horizontais — de cima ou de baixo —
+        // hospeda os ticks de Inline/Crossline; Z é o eixo "pra cima" da
+        // câmera, ver `OrbitCamera` em camera.rs) é o oposto de propósito:
+        // olhando de cima pra baixo, os labels ficam embaixo (não competindo
+        // com a face de cima, que é a que está de frente pra você); olhando
+        // de baixo pra cima, ficam em cima — pedido explícito do usuário.
+        // X é um caso à parte pro eixo inteiro (Crossline E Time, as duas
+        // arestas que fixam X): sempre à esquerda da câmera, não no canto
+        // geometricamente mais próximo — usa o vetor "direita" da própria
+        // câmera (`camera.basis()`, o mesmo do billboard de texto) em vez da
+        // direção câmera-alvo. Motivo de ser um X só pras duas: antes cada
+        // uma escolhia seu próprio canto "mais próximo" de forma independente,
+        // e podiam discordar — a aresta de Time (vertical, sobe/desce)
+        // acabava numa aresta de trás qualquer, projetando pro meio da tela
+        // em vez de ficar ao lado da caixa, mesmo com Crossline do lado
+        // certo. Usando o mesmo X pras duas, a aresta de Time sempre sai do
+        // mesmo canto onde a aresta de Crossline começa — sempre visível,
+        // nunca no meio.
+        let (camera_right, _camera_up) = self.camera.basis();
+        let side_x = if camera_right.x.abs() > 1e-4 {
+            -sgn(camera_right.x)
+        } else {
+            sgn(dir.x)
+        };
+        let near_side = Vec3::new(side_x, sgn(dir.y), -sgn(dir.z));
+        let side_for_axis = |_axis: u32| near_side;
 
+        // Deslocamentos pequenos — a caixa tem meia-largura 1.0, então
+        // qualquer coisa muito acima disso já fica "flutuando" longe da
+        // aresta em vez de colada nela.
         const EDGE_OUT: f32 = 1.0;
-        const TICK_OUT: f32 = 1.08;
-        const LABEL_OUT: f32 = 1.2;
-        const CAPTION_OUT: f32 = 1.4;
-        const TICK_COLOR: [f32; 3] = [0.75, 0.9, 1.0];
+        const TICK_OUT: f32 = 1.01;
+        const LABEL_OUT: f32 = 1.05;
+        const CAPTION_OUT: f32 = 1.12;
+        const TICK_COLOR: [f32; 3] = [1.0, 1.0, 1.0];
 
         let mut tick_lines: Vec<LineVertex> = Vec::with_capacity(grid.tick_ids.len() * 2);
         for &(id, axis, t) in &grid.tick_ids {
             let local = -1.0 + 2.0 * t;
-            let p_edge = axis_grid_point(axis, local, back, EDGE_OUT);
-            let p_tick = axis_grid_point(axis, local, back, TICK_OUT);
-            tick_lines.push(LineVertex { position: p_edge.to_array(), color: TICK_COLOR });
-            tick_lines.push(LineVertex { position: p_tick.to_array(), color: TICK_COLOR });
+            let side = side_for_axis(axis);
+            let p_edge = axis_grid_point(axis, local, side, EDGE_OUT);
+            let p_tick = axis_grid_point(axis, local, side, TICK_OUT);
+            tick_lines.push(LineVertex {
+                position: p_edge.to_array(),
+                color: TICK_COLOR,
+            });
+            tick_lines.push(LineVertex {
+                position: p_tick.to_array(),
+                color: TICK_COLOR,
+            });
 
-            let p_label = axis_grid_point(axis, local, back, LABEL_OUT);
+            let p_label = axis_grid_point(axis, local, side, LABEL_OUT);
             if let Some(label) = self.text_labels.get(&id) {
                 self.queue.write_buffer(
                     &label.params_buffer,
@@ -1422,7 +1828,7 @@ impl Renderer {
         }
 
         for &(id, axis) in &grid.caption_ids {
-            let p_caption = axis_grid_point(axis, 0.0, back, CAPTION_OUT);
+            let p_caption = axis_grid_point(axis, 0.0, side_for_axis(axis), CAPTION_OUT);
             if let Some(label) = self.text_labels.get(&id) {
                 self.queue.write_buffer(
                     &label.params_buffer,
@@ -1432,8 +1838,11 @@ impl Renderer {
             }
         }
 
-        self.queue
-            .write_buffer(&self.axis_tick_lines_buffer, 0, bytemuck::cast_slice(&tick_lines));
+        self.queue.write_buffer(
+            &self.axis_tick_lines_buffer,
+            0,
+            bytemuck::cast_slice(&tick_lines),
+        );
         self.num_axis_tick_line_vertices = tick_lines.len() as u32;
     }
 }

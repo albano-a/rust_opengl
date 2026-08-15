@@ -41,10 +41,13 @@ impl OrbitCamera {
 
     /// Posição da câmera no mundo — usada pelo shader pro termo especular
     /// (que depende de onde o observador está, ao contrário da difusa).
+    // Mundo é Z-up (Time/Depth é o eixo "pra cima" na tela, não Y — ver o
+    // comentário de convenção espacial em `lib.rs`), então é a elevação que
+    // levanta Z, e azimute/distância varrem o plano X/Y em vez de X/Z.
     pub fn eye(&self) -> Vec3 {
         let x = self.distance * self.elevation.cos() * self.azimuth.sin();
-        let y = self.distance * self.elevation.sin();
-        let z = self.distance * self.elevation.cos() * self.azimuth.cos();
+        let y = self.distance * self.elevation.cos() * self.azimuth.cos();
+        let z = self.distance * self.elevation.sin();
         self.target + Vec3::new(x, y, z)
     }
 
@@ -53,15 +56,19 @@ impl OrbitCamera {
     // com as funções atuais até ela se firmar.
     #[allow(deprecated)]
     pub fn view_proj(&self) -> Mat4 {
-        let view = Mat4::look_at_rh(self.eye(), self.target, Vec3::Y);
+        let view = Mat4::look_at_rh(self.eye(), self.target, Vec3::Z);
         let proj = Mat4::perspective_rh(self.fovy_radians, self.aspect.max(0.01), self.znear, self.zfar);
         proj * view
     }
 
-    /// Botão esquerdo do mouse: gira a câmera em torno do alvo.
+    /// Botão esquerdo do mouse: gira a câmera em torno do alvo. Sinal de
+    /// `dx` invertido de propósito — o pedido foi que o *objeto* pareça
+    /// girar na mesma direção do arrasto (arrastar pra direita, o objeto
+    /// gira pra direita), não a órbita "padrão" onde a câmera segue o
+    /// arrasto e o objeto parece girar pro lado oposto.
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         const SENSITIVITY: f32 = 0.005;
-        self.azimuth -= dx * SENSITIVITY;
+        self.azimuth += dx * SENSITIVITY;
         self.elevation = (self.elevation + dy * SENSITIVITY)
             .clamp(-Self::MAX_ELEVATION, Self::MAX_ELEVATION);
     }
@@ -70,7 +77,7 @@ impl OrbitCamera {
     pub fn pan(&mut self, dx: f32, dy: f32) {
         let eye = self.eye();
         let forward = (self.target - eye).normalize();
-        let right = forward.cross(Vec3::Y).normalize();
+        let right = forward.cross(Vec3::Z).normalize();
         let up = right.cross(forward).normalize();
 
         let sensitivity = 0.0015 * self.distance;
@@ -94,7 +101,7 @@ impl OrbitCamera {
     pub fn basis(&self) -> (Vec3, Vec3) {
         let eye = self.eye();
         let forward = (self.target - eye).normalize();
-        let right = forward.cross(Vec3::Y).normalize();
+        let right = forward.cross(Vec3::Z).normalize();
         let up = right.cross(forward).normalize();
         (right, up)
     }

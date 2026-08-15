@@ -48,11 +48,20 @@ struct VertexOutput {
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
 
-    let world_pos = text.anchor_scale.xyz
+    // `scene.model` só escala o PONTO de ancoragem (pra ele acompanhar o
+    // paralelepípedo quando o cubo não é equidimensional, ex: 250x350x100)
+    // — o deslocamento do billboard (o quad de cada caractere) é somado
+    // DEPOIS, em unidades de mundo reais, não-escaladas. Se a escala não-
+    // uniforme entrasse no billboard também, as letras ficariam esticadas/
+    // espremidas de forma diferente conforme o ângulo da câmera (o
+    // deslocamento é ao longo de `camera_right`/`camera_up`, direções
+    // arbitrárias que não estão alinhadas com os eixos X/Y/Z da escala).
+    let anchor_world = (scene.model * vec4<f32>(text.anchor_scale.xyz, 1.0)).xyz;
+    let world_pos = anchor_world
         + scene.camera_right.xyz * input.local_offset.x * text.anchor_scale.w
         + scene.camera_up.xyz * input.local_offset.y * text.anchor_scale.w;
 
-    out.clip_position = scene.view_proj * scene.model * vec4<f32>(world_pos, 1.0);
+    out.clip_position = scene.view_proj * vec4<f32>(world_pos, 1.0);
     out.uv = input.uv;
     return out;
 }

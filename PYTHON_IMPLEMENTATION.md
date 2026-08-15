@@ -172,6 +172,45 @@ Convenções que o Rust **exige** e não valida magicamente:
   atributo elástico, cada um com sua Inline/Crossline/Time simultâneas) — não há limite
   artificial, é só um `HashMap` do lado Rust.
 
+### Survey vs. volume — não são a mesma coisa
+
+**Erro fácil de cometer**: achar que o formato da caixa 3D (wireframe/grid de eixo) é uma
+propriedade do volume carregado. Não é — é uma propriedade da **survey**, definida uma vez na
+criação do projeto (igual o Andromeda grava a linha `Survey` no banco, com seus próprios
+IL/XL/Time min/max/len/sampling — mesma interface `VolumeSeismicAttributesInterface` que qualquer
+`Volume2` usa, só que é a survey quem manda no formato da caixa). Cada volume importado depois
+(sísmica, sísmica filtrada, inversão por IA, low-frequency model, fácies, atributos elásticos) tem
+seu **próprio** IL/XL/Time min/max/len/sampling — pode cobrir só uma sub-região da survey (ex: uma
+inversão cobrindo inlines 500-800 de uma survey 0-1250), não precisa bater com ela.
+
+```python
+renderer.set_survey_extent(width, height, depth)   # uma vez, na criação do projeto
+
+renderer.set_volume_placement(
+    volume_id,
+    origin_inline, origin_crossline, origin_time,      # 0..1, onde o volume começa na survey
+    extent_inline, extent_crossline, extent_time,       # 0..1, quanto da survey ele ocupa
+)
+```
+
+`set_survey_extent` controla o formato do wireframe/grid — chamar **uma vez só**, não a cada
+`add_volume` (é justamente o oposto do que a Fase 4 fazia antes dessa correção: derivar o formato
+automaticamente do último volume carregado, o que quebra assim que existe mais de um volume).
+`set_volume_placement` é opcional — sem chamar, o volume assume que cobre a survey inteira
+(`origin=(0,0,0)`, `extent=(1,1,1)`), o caso comum (a sísmica principal). Pra um volume menor, as
+duas frações por eixo são um cálculo direto a partir dos campos que o Andromeda já tem:
+
+```python
+origin = (volume.min - survey.min) / (survey.max - survey.min)
+extent = (volume.max - volume.min) / (survey.max - survey.min)
+```
+
+(mesma ideia de `_positions_from_db` em `vispy_3D_visualization_controller.py`, só que expressa
+como fração 0..1 em vez de offset+escala em amostras — o Nebula não precisa saber nada sobre
+sampling rate, só onde o volume cabe dentro da caixa da survey.) Chamar de novo com valores
+diferentes reposiciona o volume e todas as fatias que já apontam pra ele — não precisa recriar
+nada.
+
 ### Câmera e interação
 
 ```python
@@ -243,7 +282,7 @@ geometria de verdade (billboards sempre de frente pra câmera), via `add_text_la
 
 ```python
 renderer.add_text_label(
-    id, x, y, z,      # posição no mundo (convenção do cubo -1..1: X=Inline, Y=Time, Z=Crossline)
+    id, x, y, z,      # posição no mundo (convenção do cubo -1..1: X=Inline, Y=Crossline, Z=Time)
     "IL 970\nXL 1650", # \n quebra linha
     0.5, 0.83, 1.0,    # cor (r, g, b), 0..1
     0.14,              # escala
@@ -264,20 +303,23 @@ o padrão de overlay Qt abaixo pra texto. A colorbar continua sendo `QPainter` p
 — existe uma API dedicada:**
 
 ```python
-renderer.configure_axis_grid(width, height, depth)  # mesmas dimensões de add_volume
+renderer.configure_axis_grid(width, height, depth)  # mesmas dimensões de set_survey_extent
 ```
 
 Chamar uma vez (mesmo padrão "pendente" de `add_slice`: guardar e só efetivar na primeira
 `render_frame()` depois que o `Renderer` existe — ver `NebulaWindow.configure_axis_grid` no
 protótipo) cria os 3 nomes de eixo + 5 valores de tick por eixo (18 labels), com os valores reais
-já calculados a partir de `width`/`height`/`depth`. Depois disso o Rust cuida de tudo sozinho a
-cada frame: descobre qual aresta do cubo está "de costas" pra câmera atual e migra os labels/ticks
-pra lá — igual um eixo 3D de matplotlib ou o gizmo do Petrel, não um canto fixo que pode acabar na
-frente do volume depois de um orbit. Não tem por que o lado Python tentar replicar essa lógica de
-escolha de aresta; se o volume mudar de tamanho, só chamar `configure_axis_grid` de novo com as
-novas dimensões substitui o grid anterior. Tamanho da fonte dos ticks/nomes de eixo é ajustado num
-lugar só do lado Rust (`AXIS_TICK_TEXT_SCALE`/`AXIS_CAPTION_TEXT_SCALE` em `lib.rs`) — não é
-parâmetro exposto pra Python hoje.
+já calculados a partir de `width`/`height`/`depth` — que precisam ser as dimensões da **survey**
+(as mesmas de `set_survey_extent`), não de um volume específico, já que os valores de tick devem
+cobrir o range completo da caixa, não só o pedaço que um volume sub-região ocupa. Depois disso o
+Rust cuida de tudo sozinho a cada frame: descobre qual aresta do cubo está "de costas" pra câmera
+atual e migra os labels/ticks pra lá — igual um eixo 3D de matplotlib ou o gizmo do Petrel, não um
+canto fixo que pode acabar na frente do volume depois de um orbit. Não tem por que o lado Python
+tentar replicar essa lógica de escolha de aresta; se a survey mudar de tamanho (raro — normalmente
+só acontece uma vez, no projeto), só chamar `configure_axis_grid` de novo substitui o grid
+anterior. Tamanho da fonte dos ticks/nomes de eixo é ajustado num lugar só do lado Rust
+(`AXIS_TICK_TEXT_SCALE`/`AXIS_CAPTION_TEXT_SCALE` em `lib.rs`) — não é parâmetro exposto pra
+Python hoje.
 
 ### Se algum dia precisar de um overlay Qt de verdade (não-texto) sobre o canvas
 
@@ -311,7 +353,7 @@ Não é objetivo deste documento reescrever `VolumeSlicesManager`/`HorizonManage
 
 | Manager atual | Método(s) Vispy hoje | Chamada Nebula equivalente |
 |---|---|---|
-| `VolumeSlicesManager` | cria/atualiza `AxisAlignedImage` por dataset/eixo | `add_volume` (uma vez por dataset) + `add_slice`/`set_slice_axis_index` (uma vez por eixo visível) |
+| `VolumeSlicesManager` | cria/atualiza `AxisAlignedImage` por dataset/eixo; posiciona cada uma na survey via `_positions_from_db`/`_dataset_offsets` (`vispy_3D_visualization_controller.py`, offset+escala em amostras relativos à `Survey`) | `set_survey_extent` (uma vez, na criação do projeto) + `add_volume`/`set_volume_placement` (uma vez por dataset — `origin`/`extent` calculados a partir de `db_obj.iline/xline/sample.min/max` vs. os mesmos campos da `Survey`, ver seção 4) + `add_slice`/`set_slice_axis_index` (uma vez por eixo visível) |
 | Colorbar (via `ColorbarManager`) | raster matplotlib, replota a cada mudança | `ColorbarWidget` (Qt puro), só chama `.update()` |
 | `HorizonManager.add_horizon_surface_to_canvas` | `scene.visuals.Mesh` com cor assada via matplotlib | `add_horizon_picks`/`add_horizon_grid` (Fase 5) — cor vem do colormap em shader, não mais assada |
 | `Well3DPlotManager.add_well_plot` | `WellSceneRenderer.add_trajectory`/`add_log`/`add_head` | `add_well_trajectory`/`add_well_log` (Fase 5) — mesma tesselação `cigvis`, upload muda |
@@ -332,7 +374,12 @@ dataset carregar, que checkbox está marcada, que clim usar) — só a chamada f
 - Ray marching / transfer functions pro volume 3D cheio (fácies, corpo geológico) — só as
   fatias axis-aligned existem hoje.
 - Bússola/indicador de eixo XYZ como HUD.
-- Sistema de coordenadas do survey real (offset/escala por volume, quadrantes de azimute,
-  exagero vertical) — o cubo hoje é sempre um cubo unitário `-1..1`; a conversão de coordenadas
-  reais de survey pra essa faixa normalizada é responsabilidade do Python por enquanto, não tem
-  suporte nativo no Nebula ainda.
+- Azimute/rotação real da survey (`affine_transform`/`corners` da tabela `Survey`, coordenadas
+  X/Y de mundo) — o Nebula hoje só entende IL/XL/Time em amostras (`set_survey_extent`,
+  `set_volume_placement`, ambos em frações 0..1 do espaço da survey), não a orientação geográfica
+  real. Não afeta a proporção IL/XL/Time (isso já existe, ver seção 4), só a rotação/translação
+  pra coordenadas reais de mundo — relevante quando horizontes/poços entrarem (eles usam
+  `affine_transform` no Andromeda hoje).
+- Exagero vertical (escala extra só no eixo Time, independente da proporção real IL/XL/Time) —
+  `cube_scale` hoje é sempre a proporção real das 3 dimensões da survey, sem fator extra
+  ajustável pelo usuário.

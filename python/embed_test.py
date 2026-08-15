@@ -281,6 +281,21 @@ class NebulaWindow(QWindow):
         # "pendente" das fatias/labels.
         self._pending_axis_grid = None
         self._axis_grid_added = False
+        # (width, height, depth) da survey (extensão fixa em amostras,
+        # definida uma vez na criação do projeto) — controla o formato do
+        # wireframe/grid de eixo (`Renderer.set_survey_extent`). Sem chamar
+        # `set_survey_extent`, o cubo vira um cubo de verdade (escala 1:1:1),
+        # não o paralelepípedo real da survey.
+        self._pending_survey_extent = None
+        self._survey_extent_added = False
+        # volume_id -> (origin_inline, origin_crossline, origin_time,
+        # extent_inline, extent_crossline, extent_time), fração 0..1 do
+        # espaço da survey — pra volumes que não cobrem a survey inteira (ex:
+        # inversão cobrindo só parte da área). Reaplicado (não só na primeira
+        # vez) porque pode mudar depois que o volume já existe.
+        self._volume_placements = {}
+        self._volume_placements_sent = set()
+        self._volume_ids_added = set()
         self.active_slice_id = None
         self.move_mode = False
         # Fatia descoberta debaixo do cursor no início de um Ctrl+arrastar
@@ -339,6 +354,56 @@ class NebulaWindow(QWindow):
             return None
         return self._renderer.project_to_screen(x, y, z)
 
+    def set_survey_extent(self, width: int, height: int, depth: int):
+        """Extensão fixa da survey (amostras: inlines, crosslines, tempo/
+        profundidade) — chamar uma vez, na criação do projeto (mesmo momento
+        em que o Andromeda grava a `Survey` no banco). Controla o formato do
+        wireframe/grid de eixo (`Renderer.set_survey_extent`); volumes
+        importados depois (sísmica, inversão, low-frequency model, fácies)
+        não mudam mais esse formato — eles se posicionam DENTRO dele via
+        `set_volume_placement`."""
+        self._pending_survey_extent = (width, height, depth)
+        self._survey_extent_added = False
+
+    def set_volume_placement(
+        self,
+        volume_id,
+        origin_inline: float = 0.0,
+        origin_crossline: float = 0.0,
+        origin_time: float = 0.0,
+        extent_inline: float = 1.0,
+        extent_crossline: float = 1.0,
+        extent_time: float = 1.0,
+    ):
+        """Posiciona o volume `volume_id` dentro do cubo da survey — pra
+        quando ele não cobre a survey inteira (ex: uma inversão que só cobre
+        parte da área, ou um low-frequency model reamostrado mais grosso).
+        `origin_*`/`extent_*` são frações 0..1 do espaço da survey (não do
+        próprio volume): calcule a partir dos campos que o Andromeda já tem
+        no banco — `origin = (volume.min - survey.min) / survey_range`,
+        `extent = volume_range / survey_range` — por eixo (mesma ideia de
+        `_positions_from_db` em `vispy_3D_visualization_controller.py`, só
+        que expressa como fração em vez de offset+escala em amostras). Sem
+        chamar isso, o volume assume que cobre a survey inteira."""
+        self._volume_placements[volume_id] = (
+            origin_inline,
+            origin_crossline,
+            origin_time,
+            extent_inline,
+            extent_crossline,
+            extent_time,
+        )
+        renderer = self._renderer
+        if renderer is not None and volume_id in self._volume_ids_added:
+            # Volume já existe no Rust — aplica na hora (ex: usuário ajustou
+            # o posicionamento depois que tudo já estava carregado).
+            renderer.set_volume_placement(volume_id, *self._volume_placements[volume_id])
+            self._volume_placements_sent.add(volume_id)
+        else:
+            # Renderer não existe ainda, ou o volume correspondente ainda não
+            # foi enviado — `render_frame` aplica assim que o volume existir.
+            self._volume_placements_sent.discard(volume_id)
+
     def configure_axis_grid(self, width: int, height: int, depth: int):
         """Liga o grid numerado dos 3 eixos (INLINE/CROSSLINE/TIME) do cubo —
         `width`/`height`/`depth` são as dimensões do volume (mesma convenção
@@ -386,10 +451,20 @@ class NebulaWindow(QWindow):
         if renderer is None:
             return
 
+        if self._pending_survey_extent is not None and not self._survey_extent_added:
+            renderer.set_survey_extent(*self._pending_survey_extent)
+            self._survey_extent_added = True
+
         if self._pending_volume is not None:
             width, height, depth, data = self._pending_volume
             renderer.add_volume(0, width, height, depth, data)
             self._pending_volume = None
+            self._volume_ids_added.add(0)
+
+        for volume_id, placement in self._volume_placements.items():
+            if volume_id in self._volume_ids_added and volume_id not in self._volume_placements_sent:
+                renderer.set_volume_placement(volume_id, *placement)
+                self._volume_placements_sent.add(volume_id)
 
         if self._pending_colormap is not None:
             rgba, discrete = self._pending_colormap
@@ -564,7 +639,16 @@ class Slice2DDialog(QDialog):
     existirem no Nebula primeiro.
     """
 
-    def __init__(self, parent, volume_dim: int, volume_data: np.ndarray, colormap_lut: np.ndarray, clim: tuple):
+    def __init__(
+        self,
+        parent,
+        volume_width: int,
+        volume_height: int,
+        volume_depth: int,
+        volume_data: np.ndarray,
+        colormap_lut: np.ndarray,
+        clim: tuple,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Nebula - Seção 2D")
         self.resize(720, 620)
@@ -574,7 +658,14 @@ class Slice2DDialog(QDialog):
 
         self._axis_combo = QComboBox()
         self._axis_combo.addItems(AXIS_NAMES)
-        self._axis_combo.setCurrentText("Crossline")
+        # "Time" é o único eixo cujo plano de fatia nasce de frente pra
+        # câmera ortográfica fixa do modo panzoom (`PanZoomCamera` sempre olha
+        # ao longo de Z, sem rotação) — Inline/Crossline aparecem de perfil
+        # (quase invisíveis) nesse modo hoje. Limitação preexistente do
+        # diálogo 2D (não depende da convenção de eixo do mundo), não
+        # resolvida nesta fase; deixar como default evita abrir o diálogo já
+        # quebrado.
+        self._axis_combo.setCurrentText("Time")
 
         self._position_slider = QSlider(Qt.Horizontal)
         self._position_slider.setMinimum(0)
@@ -597,12 +688,16 @@ class Slice2DDialog(QDialog):
         layout.addLayout(top_bar)
         layout.addLayout(canvas_row, stretch=1)
 
-        self._render_window.set_volume(volume_dim, volume_dim, volume_dim, volume_data)
+        # Mesma extensão de survey do cubo 3D — sem isso a fatia 2D renderiza
+        # com proporção 1:1 em vez da proporção real dos dados (`cube_scale`
+        # afeta a fatia igual afeta o wireframe, mesmo em modo panzoom).
+        self._render_window.set_survey_extent(volume_width, volume_height, volume_depth)
+        self._render_window.set_volume(volume_width, volume_height, volume_depth, volume_data)
         self._render_window.set_colormap(colormap_lut)
         self._render_window.set_clim(*clim)
         # O diálogo 2D mostra uma fatia por vez (a que o combobox escolher) —
         # diferente do cubo 3D, que mostra as três ao mesmo tempo.
-        self._render_window.configure_slices({0: (AXIS_INDEX["Crossline"], 0.5)}, active_slice_id=0)
+        self._render_window.configure_slices({0: (AXIS_INDEX["Time"], 0.5)}, active_slice_id=0)
 
         self._axis_combo.currentTextChanged.connect(self._on_axis_changed)
         self._position_slider.valueChanged.connect(self._on_position_changed)
@@ -734,12 +829,28 @@ def main():
     container = QWidget.createWindowContainer(render_window, main_win)
     main_win.setCentralWidget(container)
 
-    volume_dim = 128
-    volume_data = build_synthetic_volume(volume_dim, volume_dim, volume_dim, pattern=VOLUME_PATTERN)
+    # Paralelepípedo de verdade, não um cubo: as três dimensões diferem de
+    # propósito (250 inlines x 350 crosslines x 100 amostras) pra validar que
+    # o Nebula escala o volume/wireframe/grid de eixo pela extensão real de
+    # cada eixo (`Renderer::cube_scale`), em vez de forçar tudo num cubo -1..1.
+    volume_width = 250
+    volume_height = 350
+    volume_depth = 100
+    volume_data = build_synthetic_volume(volume_width, volume_height, volume_depth, pattern=VOLUME_PATTERN)
     colormap_lut = build_colormap_lut(COLORMAP_NAME)
     clim = (0.0, 1.0)  # bate com a faixa de valores do volume sintético
 
-    render_window.set_volume(volume_dim, volume_dim, volume_dim, volume_data)
+    # A extensão da SURVEY é fixa e definida uma vez (igual o Andromeda grava
+    # a `Survey` no banco na criação do projeto) — controla o formato do
+    # wireframe/grid de eixo, independente de qualquer volume específico.
+    # Neste protótipo o único volume carregado (a sísmica principal) cobre a
+    # survey inteira, então usa as mesmas dimensões; um volume que cobrisse só
+    # parte da área (ex: uma inversão) chamaria `set_volume_placement` depois
+    # de `set_volume` pra se posicionar dentro dela sem mudar o formato do
+    # cubo.
+    render_window.set_survey_extent(volume_width, volume_height, volume_depth)
+
+    render_window.set_volume(volume_width, volume_height, volume_depth, volume_data)
     render_window.set_colormap(colormap_lut)
     render_window.set_clim(*clim)
     # As três fatias (Inline/Crossline/Time) sempre visíveis ao mesmo tempo,
@@ -755,7 +866,7 @@ def main():
         active_slice_id=AXIS_INDEX["Crossline"],
     )
 
-    render_window.configure_axis_grid(volume_dim, volume_dim, volume_dim)
+    render_window.configure_axis_grid(volume_width, volume_height, volume_depth)
 
     tree_dock = QDockWidget("Object Tree", main_win)
     tree_dock.setWidget(build_object_tree())
@@ -765,7 +876,9 @@ def main():
 
     def open_2d_dialog():
         if dialog_2d["instance"] is None:
-            dialog_2d["instance"] = Slice2DDialog(main_win, volume_dim, volume_data, colormap_lut, clim)
+            dialog_2d["instance"] = Slice2DDialog(
+                main_win, volume_width, volume_height, volume_depth, volume_data, colormap_lut, clim
+            )
         dialog_2d["instance"].show()
         dialog_2d["instance"].raise_()
         dialog_2d["instance"].activateWindow()

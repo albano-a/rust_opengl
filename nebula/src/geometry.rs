@@ -29,10 +29,26 @@ impl SliceVertex {
 const N: [f32; 3] = [0.0, 0.0, 1.0];
 
 pub const SLICE_VERTICES: [SliceVertex; 4] = [
-    SliceVertex { position: [-1.0, -1.0, 0.0], uv: [0.0, 1.0], normal: N },
-    SliceVertex { position: [1.0, -1.0, 0.0], uv: [1.0, 1.0], normal: N },
-    SliceVertex { position: [1.0, 1.0, 0.0], uv: [1.0, 0.0], normal: N },
-    SliceVertex { position: [-1.0, 1.0, 0.0], uv: [0.0, 0.0], normal: N },
+    SliceVertex {
+        position: [-1.0, -1.0, 0.0],
+        uv: [0.0, 1.0],
+        normal: N,
+    },
+    SliceVertex {
+        position: [1.0, -1.0, 0.0],
+        uv: [1.0, 1.0],
+        normal: N,
+    },
+    SliceVertex {
+        position: [1.0, 1.0, 0.0],
+        uv: [1.0, 0.0],
+        normal: N,
+    },
+    SliceVertex {
+        position: [-1.0, 1.0, 0.0],
+        uv: [0.0, 0.0],
+        normal: N,
+    },
 ];
 
 pub const SLICE_INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
@@ -61,19 +77,46 @@ impl LineVertex {
 
 // Caixa unitária (-1..1 em cada eixo) delimitando o volume sísmico — mesma
 // convenção espacial usada por `slice_model_matrix` no lib.rs (X=Inline,
-// Y=-Time, Z=Crossline). Cor ciano clara, parecida com o wireframe de
-// referência do Petrel/Ocean.
-const WIREFRAME_COLOR: [f32; 3] = [0.4, 0.75, 1.0];
+// Y=Crossline, Z=Time, mundo Z-up). Cor ciano clara, parecida com o
+// wireframe de referência do Petrel/Ocean.
+const R: f32 = 255.0;
+const G: f32 = 255.0;
+const B: f32 = 255.0;
+const WIREFRAME_COLOR: [f32; 3] = [R / 255.0, G / 255.0, B / 255.0];
 
 pub const WIREFRAME_VERTICES: [LineVertex; 8] = [
-    LineVertex { position: [-1.0, -1.0, -1.0], color: WIREFRAME_COLOR },
-    LineVertex { position: [1.0, -1.0, -1.0], color: WIREFRAME_COLOR },
-    LineVertex { position: [1.0, 1.0, -1.0], color: WIREFRAME_COLOR },
-    LineVertex { position: [-1.0, 1.0, -1.0], color: WIREFRAME_COLOR },
-    LineVertex { position: [-1.0, -1.0, 1.0], color: WIREFRAME_COLOR },
-    LineVertex { position: [1.0, -1.0, 1.0], color: WIREFRAME_COLOR },
-    LineVertex { position: [1.0, 1.0, 1.0], color: WIREFRAME_COLOR },
-    LineVertex { position: [-1.0, 1.0, 1.0], color: WIREFRAME_COLOR },
+    LineVertex {
+        position: [-1.0, -1.0, -1.0],
+        color: WIREFRAME_COLOR,
+    },
+    LineVertex {
+        position: [1.0, -1.0, -1.0],
+        color: WIREFRAME_COLOR,
+    },
+    LineVertex {
+        position: [1.0, 1.0, -1.0],
+        color: WIREFRAME_COLOR,
+    },
+    LineVertex {
+        position: [-1.0, 1.0, -1.0],
+        color: WIREFRAME_COLOR,
+    },
+    LineVertex {
+        position: [-1.0, -1.0, 1.0],
+        color: WIREFRAME_COLOR,
+    },
+    LineVertex {
+        position: [1.0, -1.0, 1.0],
+        color: WIREFRAME_COLOR,
+    },
+    LineVertex {
+        position: [1.0, 1.0, 1.0],
+        color: WIREFRAME_COLOR,
+    },
+    LineVertex {
+        position: [-1.0, 1.0, 1.0],
+        color: WIREFRAME_COLOR,
+    },
 ];
 
 // 12 arestas do cubo, como pares de índices pra `PrimitiveTopology::LineList`.

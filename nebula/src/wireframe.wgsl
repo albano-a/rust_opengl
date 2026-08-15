@@ -1,7 +1,9 @@
-// Wireframe da caixa do cubo sísmico: linhas sólidas, sem luz, sempre visíveis
-// por cima do resto da cena (depth test sempre passa, sem escrever no depth
-// buffer) — é uma referência espacial, não geometria "real" que deveria
-// ocluir ou ser ocluída pelas fatias.
+// Wireframe da caixa do cubo sísmico: linhas sólidas, sem luz. É um objeto
+// de verdade na cena, não um HUD — o pipeline (`lib.rs`) usa
+// `depth_compare: Less`, então uma aresta fica escondida atrás de uma fatia
+// opaca que esteja na frente dela, igual qualquer geometria normal. Não
+// escreve no depth buffer (`depth_write_enabled: false`), então também não
+// bloqueia nada desenhado depois dele (os ticks do grid de eixo, o texto).
 struct SceneUniform {
     view_proj: mat4x4<f32>,
     model: mat4x4<f32>,

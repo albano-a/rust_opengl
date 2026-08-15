@@ -29,6 +29,8 @@ Fases 1–4 concluídas. O crate `nebula/` expõe uma classe `Renderer` com esta
 | `resize(w, h)` | reconfigura a `Surface` e o aspect da câmera |
 | `orbit(dx, dy)` / `pan(dx, dy)` / `zoom(delta)` | controle de câmera (orbit só afeta o modo `"orbit"`) |
 | `add_volume(id, w, h, d, data)` / `remove_volume(id)` | textura 3D por id, ordem (inline, xline, amostra) |
+| `set_survey_extent(width, height, depth)` | extensão fixa da survey (em amostras) — controla o formato do wireframe/grid (`cube_scale`); chamar uma vez, na criação do projeto, não a cada volume |
+| `set_volume_placement(id, origin_il, origin_xl, origin_t, extent_il, extent_xl, extent_t)` | posiciona o volume `id` DENTRO da survey (frações 0..1) — pra volumes que não cobrem a survey inteira (inversão, low-frequency model); default cobre 100% |
 | `set_volume_colormap(id, rgba, discrete)` / `set_volume_clim(id, min, max)` / `set_volume_opacity(id, opacity)` | LUT contínua ou discreta (fácies), faixa de valores, opacidade (padrão 1.0) |
 | `add_slice(slice_id, volume_id, axis, index)` / `remove_slice(id)` / `set_slice_visible(id, bool)` / `set_slice_axis_index(id, axis, index)` | fatias (`AxisAlignedImage`) posicionadas de verdade no espaço 3D do cubo; várias por volume, todas simultâneas |
 | `nudge_slice(id, screen_dx, screen_dy) -> index` | move uma fatia arrastando o mouse, projetando o eixo de movimento real na tela |
@@ -39,7 +41,8 @@ Fases 1–4 concluídas. O crate `nebula/` expõe uma classe `Renderer` com esta
 | `render()` | desenha um frame |
 
 Convenção espacial fixa (cubo unitário -1..1, usada por `add_slice`/picking/labels): mundo
-**X = Inline, Y = Time (topo = raso), Z = Crossline**.
+**X = Inline, Y = Crossline, Z = Time (topo = raso)** — mundo é **Z-up** (a câmera orbital usa Z
+como eixo "pra cima", não Y; ver "Sexta correção" abaixo pro porquê).
 
 Ver [`PYTHON_IMPLEMENTATION.md`](PYTHON_IMPLEMENTATION.md) pra como integrar isso no Andromeda de
 verdade (o `python/embed_test.py` é só o protótipo de validação, não código pra copiar direto).
@@ -463,6 +466,137 @@ qualquer software 3D de verdade (Petrel, matplotlib `mplot3d`) faz.
       ferramenta de captura nesta sessão, não do código — mesma classe de limitação já registrada
       na correção da opacidade); a lógica em si é álgebra vetorial determinística (inverte o sinal
       da direção câmera→alvo por eixo) e compilou/rodou sem erro em todos os testes.
+
+**Sexta correção — canto errado, espaçamento errado, e o mundo virou Z-up**: três ajustes em
+sequência depois de testar a quinta correção de verdade.
+
+- [x] **Canto "de trás" era o errado**: o texto ignora o depth buffer de propósito
+      (`depth_compare: Always`), então a pergunta certa não é "o que está oculto atrás da fatia",
+      e sim "que canto do cubo projeta pra fora da silhueta na tela". O canto mais **próximo** da
+      câmera é sempre um vértice real da silhueta (é literalmente o ponto do cubo mais perto do
+      observador); o canto mais distante não tem essa garantia — em ângulos elevados, a perspectiva
+      empurra o canto de trás pra dentro da silhueta, e como o texto ignora profundidade, ele
+      aparecia desenhado por cima das fatias sísmicas em vez de fora da caixa (reproduzido com
+      captura de tela real do usuário). `near_side` em `update_axis_grid` (`lib.rs`) inverteu de
+      "canto oposto à câmera" pra "canto mais próximo".
+- [x] **Espaçamento reduzido**: `TICK_OUT`/`LABEL_OUT`/`CAPTION_OUT` eram grandes demais pra uma
+      caixa de meia-largura 1.0 (traço de tick longo, número flutuando longe da aresta) — reduzidos
+      pra ficarem colados na caixa.
+- [x] **Crossline sempre à esquerda da câmera**: pedido explícito, independente da regra de canto
+      mais próximo — usa o vetor "direita" da própria câmera (`camera.basis()`, o mesmo do
+      billboard de texto) pra decidir de que lado botar a aresta de Crossline, não a direção
+      câmera-alvo.
+- [x] **Mundo virou Z-up**: o usuário identificou que a convenção Y-up (Time no eixo vertical da
+      câmera) estava conceitualmente errada pro que ele queria — a convenção correta é **X=Inline,
+      Y=Crossline, Z=Time**, com Z sendo o eixo "pra cima" da câmera (não Y). Mudança mecânica mas
+      abrangente:
+      - `OrbitCamera` (`camera.rs`): `eye()` agora levanta Z com a elevação (antes levantava Y);
+        `view_proj`/`pan`/`basis` usam `Vec3::Z` como "up" em vez de `Vec3::Y`.
+      - `slice_move_axis`/`slice_model_matrix` (`lib.rs`): Crossline (antes fixava Z, sem rotação —
+        era o "caso de graça" por coincidência com o quad nascer no plano XY local) agora fixa Y e
+        precisa de rotação; Time (antes fixava Y, com rotação) agora fixa Z e virou o novo "caso de
+        graça" (nasce perpendicular a Z sem rotação nenhuma).
+      - `axis_grid_point` (`lib.rs`): mapa de qual componente de `near_side` cada eixo usa
+        atualizado pra bater com o novo mundo.
+      - **`PanZoomCamera` (visão 2D) não mudou** — continua olhando ao longo de Z com "up" = Y,
+        porque é uma câmera ortográfica plana sem noção de "up do mundo 3D". Isso expôs uma
+        limitação preexistente (já existia antes desta correção, só que pra outro eixo): só a fatia
+        cujo plano nasce sem rotação fica de frente pra essa câmera fixa — antes era Crossline,
+        agora é Time. `Slice2DDialog` (`embed_test.py`) trocou o eixo default de "Crossline" pra
+        "Time" pra continuar funcionando; Inline/Crossline aparecem de perfil no diálogo 2D hoje.
+        Resolver isso de verdade (a câmera 2D se reorientar conforme o eixo escolhido) fica pra uma
+        fase futura, não é regressão desta correção.
+      - Compilou limpo, rodou sem erro; verificação visual do resultado final não foi possível
+        nesta sessão pelo mesmo motivo de ferramenta de captura já registrado acima.
+
+**Sétima correção — survey vs. volume não são a mesma coisa**: pedido pra aumentar o cubo pra um
+paralelepípedo (250x350x100) expôs um erro conceitual maior — `cube_scale` (o formato do
+wireframe/grid) era derivado automaticamente de `add_volume`, ou seja, o **último volume
+carregado decidia o formato da caixa inteira**. Isso quebra assim que existe mais de um volume: no
+Andromeda de verdade, a **survey** (extensão IL/XL/Time física) é definida **uma vez**, na criação
+do projeto, e cada volume importado depois (sísmica, sísmica filtrada, inversão por IA,
+low-frequency model, fácies, atributos) pode cobrir só uma **sub-região** dela, com seu próprio
+sampling — uma inversão cobrindo inlines 500-800 de uma survey 0-1250 não pode fazer a caixa
+inteira encolher pra caber nela.
+
+Antes de implementar, investigamos como o **Andromeda de verdade** resolve isso hoje (agente de
+exploração sobre `C:\Users\Icarl\Documents\GitHub\andromeda`), pra não inventar uma arquitetura
+errada:
+
+- **Survey**: uma linha só na tabela `Survey` (banco do projeto), com os mesmos campos IL/XL/Time
+  min/max/len/sampling que qualquer volume tem (via `VolumeSeismicAttributesInterface`, mixin
+  compartilhado). `vispy_3D_visualization_controller.py::set_ref_volume_shape` deriva
+  `self.shape = (iline.len, xline.len, sample.len)` dela — o "formato fixo" que nunca muda.
+- **Volume**: toda importação (`Volume2`, uma tabela só, diferenciada por `seismic_data_type`)
+  tem seu **próprio** IL/XL/Time min/max/len/sampling, independente da survey.
+- **Posicionamento**: `_positions_from_db` (mesmo arquivo, ~linha 1018) calcula, por eixo, um
+  offset (`(child_min - parent_min) / parent_sampling`) e uma escala (`child_sampling /
+  parent_sampling`) do volume relativo à survey — Time é tratado invertido (`flipped=True`, mesmo
+  espírito do "topo = raso" que o Nebula já tem). `VolumeSlicesManager` aplica isso em cada fatia
+  via `set_world_offset`/`set_processed_axis_scales`.
+- Convenção de eixo confirmada (não suposição): **eixo 0 = Inline, eixo 1 = Crossline, eixo 2 =
+  Time/Depth** — bate exatamente com o que o Nebula já assume.
+
+Réplica no Nebula (mais simples que o offset+escala-em-amostras do Andromeda: expressa como fração
+0..1 da survey, não em unidades de amostra — o lado Rust não precisa saber nada de sampling rate):
+
+- [x] `VolumeEntry` ganhou `origin: Vec3, extent: Vec3` (default `(0,0,0)`/`(1,1,1)` = cobre a
+      survey inteira).
+- [x] `volume_placement_matrix(origin, extent)` (`lib.rs`): escala por `extent` + translada por
+      `origin*2-1+extent` — reduz a identidade exata quando não há sub-região (compatível com todo
+      o comportamento anterior).
+- [x] `Renderer::set_survey_extent(width, height, depth)`: substitui a derivação automática de
+      `cube_scale` que antes vivia em `add_volume` — chamado uma vez, não a cada volume.
+- [x] `Renderer::set_volume_placement(id, origin_il, origin_xl, origin_t, extent_il, extent_xl,
+      extent_t)`: posiciona um volume dentro da survey; refaz o `model` cacheado de toda fatia
+      já existente desse volume (`refresh_slice`).
+- [x] `SliceEntry` ganhou `model: Mat4` cacheado (`volume_placement_matrix * slice_model_matrix`,
+      recalculado em `refresh_slice`) — reusado por `pick_slice` em vez de recalcular do zero, e
+      necessário porque `pick_slice`/`nudge_slice` agora precisam saber o posicionamento do volume
+      da fatia, não só o formato da survey.
+- [x] `nudge_slice`: a direção/magnitude do arrasto agora multiplica também pela `extent` do
+      volume no eixo movido — um volume que cobre só 30% da survey num eixo anda só 30% da
+      distância por unidade de `index`, comparado a um volume que cobre a survey inteira.
+- [x] Verificado com um script à parte (dois volumes, um cobrindo a survey inteira e outro só um
+      quadrante dela via `set_volume_placement`): `add_volume`/`set_volume_placement`/`add_slice`
+      não erram, `pick_slice` acha uma fatia sem panicar, `nudge_slice` no volume sub-região move o
+      índice corretamente (0.5 → 0.56) — sem crash, sem `NaN`. Verificação visual (a caixa menor
+      aparecendo de verdade dentro da caixa maior) não foi possível pelo mesmo motivo de ferramenta
+      de captura já registrado nas correções anteriores.
+- [x] `embed_test.py`: `set_volume` sozinho não basta mais pra definir o formato do cubo —
+      `main()` e `Slice2DDialog` agora chamam `set_survey_extent` explicitamente (regressão que
+      teria voltado o cubo pro formato 1:1:1 se esquecida).
+
+**Oitava correção — o grid é um objeto, não um HUD; e MSAA 8x**: dois ajustes.
+
+- [x] **Texto/ticks do grid agora respeitam profundidade**: `text_pipeline` usava
+      `depth_compare: Always` (desenhava por cima de tudo, nunca escondido), tratamento
+      deliberado de "anotação tipo HUD" da Terceira correção — só que o usuário apontou que isso
+      está errado pro grid de eixo: CROSSLINE (e qualquer tick/label) tem que ficar **atrás** de
+      uma fatia opaca, se a fatia estiver na frente da câmera em relação a ele, igual qualquer
+      geometria normal da cena ("o volume é um objeto, o grid é um objeto"). Trocado pra
+      `depth_compare: Less` — mesmo tratamento que o `wireframe_pipeline` já usava desde a
+      Segunda correção. Continua sem escrever profundidade (`depth_write_enabled: false`), então
+      um label não bloqueia outro atrás dele.
+- [x] **MSAA 8x**: nenhum pipeline tinha antialiasing (`MultisampleState::default()` = 1 sample,
+      raiz das bordas serrilhadas no wireframe/fatias/ticks). Adicionado com detecção dinâmica de
+      suporte (`best_common_sample_count`, tenta 8→4→2→1, olhando o que o adapter suporta pros
+      formatos de cor E profundidade em uso ao mesmo tempo — os dois precisam bater no mesmo
+      render pass) em vez de fixar 8 e arriscar um adapter que não suporte. Implementação: textura
+      de cor multisampled (`msaa_color_view`) onde a cena é desenhada de verdade, resolvida
+      (`resolve_target`) na textura de 1 sample da swapchain no fim do render pass; textura de
+      profundidade também recriada com o mesmo sample count; todos os 3 pipelines
+      (`slice`/`wireframe`/`text`) atualizados pra usar esse sample count.
+  - **Pegadinha real encontrada**: `adapter.get_texture_format_features(...)` já reportava 8x
+    como suportado, mas criar as texturas/pipelines com `sample_count: 8` mesmo assim falhava
+    com erro de validação — o wgpu só garante os sample counts do spec da WebGPU (`[1,4]`) a
+    menos que a feature `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` seja pedida explicitamente em
+    `request_device`, mesmo em hardware que suporta mais. Corrigido pedindo essa feature
+    (`& adapter.features()`, nunca pede o que o adapter não tem — adapter mais antigo cai de
+    volta pro `[1,4]` do spec sem quebrar).
+  - Verificado: rodou limpo, **zero** erros de validação wgpu no log (antes da correção da
+    feature, o log tinha uma dúzia deles, um por textura/pipeline criado com sample count 8
+    inválido).
 
 ## Fase 5 — Objetos sísmicos específicos (planejada)
 
