@@ -22,8 +22,10 @@ var volume_sampler: sampler;
 var colormap_texture: texture_1d<f32>;
 @group(2) @binding(1)
 var colormap_sampler: sampler;
+// x = min, y = max, z = opacidade (0..1, default 1.0 = opaco — igual o
+// Andromeda deixa o usuário ajustar por volume); w não usado (padding).
 @group(2) @binding(2)
-var<uniform> clim: vec4<f32>; // x = min, y = max; zw não usados (padding)
+var<uniform> clim: vec4<f32>;
 
 // Qual eixo do volume esta fatia mostra, em que posição normalizada (0..1)
 // ao longo dele, e onde/como o quad plano precisa ficar no espaço 3D do
@@ -102,7 +104,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     if (scene.flags.x < 0.5) {
         // Visão 2D: cor crua do colormap, sem sombreamento.
-        return vec4<f32>(albedo, 1.0);
+        return vec4<f32>(albedo, clim.z);
     }
 
     var normal = normalize(input.world_normal);
@@ -124,5 +126,5 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let diffuse = max(dot(normal, light_dir), 0.0);
 
     let lit = albedo * (ambient + diffuse);
-    return vec4<f32>(lit, 1.0);
+    return vec4<f32>(lit, clim.z);
 }

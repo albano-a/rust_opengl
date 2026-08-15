@@ -9,6 +9,11 @@
 pub struct Colormap {
     pub bind_group: wgpu::BindGroup,
     clim_buffer: wgpu::Buffer,
+    clim: (f32, f32),
+    // Opacidade do volume (0..1) — igual o Andromeda deixa o usuário ajustar.
+    // Vive no `z` do uniform de clim (que já tinha padding ali) pra não
+    // precisar de um bind group novo só pra isso. Default 1.0 (opaco).
+    opacity: f32,
 }
 
 impl Colormap {
@@ -77,11 +82,12 @@ impl Colormap {
             ..Default::default()
         });
 
+        let opacity = 1.0_f32;
         let clim_buffer = wgpu::util::DeviceExt::create_buffer_init(
             device,
             &wgpu::util::BufferInitDescriptor {
                 label: Some("clim_buffer"),
-                contents: bytemuck::cast_slice(&[[clim.0, clim.1, 0.0, 0.0f32]]),
+                contents: bytemuck::cast_slice(&[[clim.0, clim.1, opacity, 0.0f32]]),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             },
         );
@@ -105,14 +111,26 @@ impl Colormap {
             ],
         });
 
-        Self { bind_group, clim_buffer }
+        Self { bind_group, clim_buffer, clim, opacity }
     }
 
-    pub fn set_clim(&self, queue: &wgpu::Queue, clim: (f32, f32)) {
+    pub fn set_clim(&mut self, queue: &wgpu::Queue, clim: (f32, f32)) {
+        self.clim = clim;
+        self.write_buffer(queue);
+    }
+
+    /// Opacidade do volume (0..1) — equivalente ao slider de opacidade do
+    /// Andromeda. Não recria nada, só reescreve o mesmo uniform do clim.
+    pub fn set_opacity(&mut self, queue: &wgpu::Queue, opacity: f32) {
+        self.opacity = opacity.clamp(0.0, 1.0);
+        self.write_buffer(queue);
+    }
+
+    fn write_buffer(&self, queue: &wgpu::Queue) {
         queue.write_buffer(
             &self.clim_buffer,
             0,
-            bytemuck::cast_slice(&[[clim.0, clim.1, 0.0, 0.0f32]]),
+            bytemuck::cast_slice(&[[self.clim.0, self.clim.1, self.opacity, 0.0f32]]),
         );
     }
 }

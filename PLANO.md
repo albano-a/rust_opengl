@@ -306,6 +306,27 @@ primeiro): ray marching/transfer functions pro volume 3D cheio (fácies/corpo ge
 horizonte como linha sobreposta na seção 2D, traço do poço sobreposto na seção 2D, ticks/labels
 numéricos (IL/XL/Time) ao redor do wireframe — por enquanto só a caixa, sem texto.
 
+**Segunda correção (mesma sessão de teste visual)**: duas coisas mais erradas encontradas
+depois de ver o cubo de verdade renderizando:
+
+- [x] **"Opacidade" indesejada era o wireframe vazando através das fatias opacas**, não um bug
+      de blend nas fatias em si. A caixa usava `depth_compare: Always` (desenhava por cima de
+      tudo, inclusive das arestas de trás que deveriam estar escondidas atrás de uma fatia
+      opaca) — trocado pra `depth_compare: Less` (`depth_write` continua `false`, então o
+      wireframe não bloqueia nada desenhado depois dele, só respeita o que já foi desenhado
+      antes). Aproveitando, também **adicionada opacidade de verdade** por volume
+      (`set_volume_opacity`, padrão 1.0 = opaco) — igual o Andromeda tem — reaproveitando o
+      padding `z` do uniform de `clim` (`colormap.rs`) e trocando o blend do `slice_pipeline` de
+      `REPLACE` pra `ALPHA_BLENDING` (idêntico a opaco quando `opacity=1.0`, só mistura de
+      verdade se o usuário abaixar o slider).
+- [x] **Ctrl+arrastar agora funciona em cima de qualquer fatia da cena, sem precisar da
+      combobox** — `Renderer::pick_slice(screen_x, screen_y)` (`lib.rs`) desprojeta o pixel num
+      raio de mundo (inversa da `view_proj`) e testa interseção contra o plano de cada fatia
+      visível (usando a mesma `slice_model_matrix`), devolvendo a mais próxima da câmera dentro
+      dos limites do quad. `NebulaWindow.mousePressEvent` faz o pick assim que Ctrl é
+      pressionado; a combobox+"Mover" continuam sendo o fluxo explícito (estilo Andromeda) que
+      não depende de picking.
+
 ## Fases seguintes
 
 5. **Objetos sísmicos específicos** (ver seção "Cobertura funcional" abaixo): horizontes,

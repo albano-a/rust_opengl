@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::num::NonZeroIsize;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -386,7 +386,11 @@ impl Renderer {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    // Blend normal (não REPLACE): com opacidade default 1.0 o
+                    // resultado é idêntico a opaco (src cobre 100%, dst não
+                    // contribui) — só passa a misturar de verdade quando o
+                    // usuário abaixa a opacidade do volume (ver colormap.rs).
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -464,8 +468,13 @@ impl Renderer {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
+                // Depth normal (Less) e sem escrever: o wireframe respeita o
+                // que já foi desenhado (não aparece "por trás" de uma fatia
+                // opaca — antes usava `Always`, o que fazia a caixa vazar
+                // através das fatias e parecer transparência), mas também
+                // não bloqueia nada que seja desenhado depois dele.
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -646,6 +655,17 @@ impl Renderer {
         Ok(())
     }
 
+    /// Opacidade do volume `id` (0..1, default 1.0 = totalmente opaco) —
+    /// equivalente ao slider de opacidade que o usuário já tem no Andromeda.
+    fn set_volume_opacity(&mut self, id: u64, opacity: f32) -> PyResult<()> {
+        let entry = self
+            .volumes
+            .get_mut(&id)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("volume {id} não encontrado")))?;
+        entry.colormap.set_opacity(&self.queue, opacity);
+        Ok(())
+    }
+
     /// Adiciona uma fatia (equivalente ao `AxisAlignedImage` do VisPy) do
     /// volume `volume_id`, sob o id `slice_id` escolhido pelo lado Python.
     /// `axis`: 0 = Inline, 1 = Crossline, 2 = Time (mesma convenção do
@@ -764,6 +784,64 @@ impl Renderer {
 
         self.set_slice_axis_index(slice_id, axis, new_index)?;
         Ok(new_index)
+    }
+
+    /// Descobre qual fatia está embaixo do cursor (coordenadas de tela em
+    /// pixels, origem no canto superior esquerdo, mesmo sistema dos eventos
+    /// de mouse do Qt) — permite Ctrl+arrastar direto em cima de qualquer
+    /// fatia da cena, sem precisar selecioná-la antes numa combobox.
+    ///
+    /// Faz o de sempre: desprojeta o pixel num raio em espaço de mundo
+    /// (usando a inversa de `view_proj`) e testa interseção contra o plano
+    /// de cada fatia visível, usando a própria `slice_model_matrix` — o
+    /// plano da fatia é sempre o local Z=0 transformado por esse `model`.
+    /// Entre os planos atingidos dentro dos limites do quad (-1..1 local),
+    /// devolve o mais próximo da câmera.
+    fn pick_slice(&self, screen_x: f32, screen_y: f32) -> Option<u64> {
+        let width = self.config.width.max(1) as f32;
+        let height = self.config.height.max(1) as f32;
+        let ndc_x = (screen_x / width) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (screen_y / height) * 2.0;
+
+        let inv_view_proj = self.camera.view_proj().inverse();
+        let near = inv_view_proj * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+        let far = inv_view_proj * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+        let ray_origin = near.truncate() / near.w;
+        let ray_end = far.truncate() / far.w;
+        let ray_dir = (ray_end - ray_origin).normalize();
+
+        let mut best: Option<(u64, f32)> = None;
+        for (&id, slice) in self.slices.iter() {
+            if !slice.visible {
+                continue;
+            }
+            let model = slice_model_matrix(slice.axis, slice.index);
+            let normal = (model * Vec4::new(0.0, 0.0, 1.0, 0.0)).truncate().normalize();
+            let point_on_plane = (model * Vec4::new(0.0, 0.0, 0.0, 1.0)).truncate();
+
+            let denom = normal.dot(ray_dir);
+            if denom.abs() < 1e-6 {
+                continue;
+            }
+            let t = (point_on_plane - ray_origin).dot(normal) / denom;
+            if t < 0.0 {
+                continue;
+            }
+
+            let hit_world = ray_origin + ray_dir * t;
+            let local = model.inverse() * Vec4::new(hit_world.x, hit_world.y, hit_world.z, 1.0);
+            if local.x.abs() <= 1.0 && local.y.abs() <= 1.0 {
+                let closer = match best {
+                    Some((_, best_t)) => t < best_t,
+                    None => true,
+                };
+                if closer {
+                    best = Some((id, t));
+                }
+            }
+        }
+
+        best.map(|(id, _)| id)
     }
 
     fn render(&mut self) -> PyResult<()> {

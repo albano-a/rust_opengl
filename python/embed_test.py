@@ -220,12 +220,16 @@ class NebulaWindow(QWindow):
         self._pending_volume = None
         self._pending_colormap = None
         self._pending_clim = None
+        self._pending_opacity = None
         # slice_id -> (axis, index); adicionadas de verdade no Rust na
         # primeira render_frame() depois que o Renderer existe.
         self._slices = {}
         self._slices_added = set()
         self.active_slice_id = None
         self.move_mode = False
+        # Fatia descoberta debaixo do cursor no início de um Ctrl+arrastar
+        # (não depende da combobox — só de onde o mouse realmente está).
+        self._ctrl_drag_slice_id = None
         # Chamado (slice_id, axis, index) sempre que uma fatia muda, inclusive
         # por Ctrl+arrastar/Mover — quem hospeda a janela (ex: Slice2DDialog)
         # pode plugar aqui pra manter slider/combobox em sincronia.
@@ -249,6 +253,11 @@ class NebulaWindow(QWindow):
 
     def set_clim(self, min_value: float, max_value: float):
         self._pending_clim = (min_value, max_value)
+
+    def set_volume_opacity(self, opacity: float):
+        # Igual o Andromeda: opacidade é ajustável, mas o padrão é 1.0
+        # (totalmente opaco) — só some quando o usuário mexe de propósito.
+        self._pending_opacity = opacity
 
     def set_move_mode(self, enabled: bool):
         # Equivalente ao botão "Mover" do Andromeda: com o modo ativo, um
@@ -303,6 +312,10 @@ class NebulaWindow(QWindow):
             renderer.set_volume_clim(0, *self._pending_clim)
             self._pending_clim = None
 
+        if self._pending_opacity is not None:
+            renderer.set_volume_opacity(0, self._pending_opacity)
+            self._pending_opacity = None
+
         for slice_id, (axis, index) in self._slices.items():
             if slice_id not in self._slices_added:
                 renderer.add_slice(slice_id, 0, axis, index)
@@ -313,10 +326,19 @@ class NebulaWindow(QWindow):
     def mousePressEvent(self, event):
         self._drag_button = event.button()
         self._last_pos = event.pos()
+        self._ctrl_drag_slice_id = None
+        if event.modifiers() & Qt.ControlModifier:
+            renderer = self._ensure_renderer()
+            if renderer is not None:
+                # Ctrl+clique não precisa da combobox: descobre embaixo de
+                # qual fatia o cursor está de verdade, na cena.
+                pos = event.pos()
+                self._ctrl_drag_slice_id = renderer.pick_slice(float(pos.x()), float(pos.y()))
 
     def mouseReleaseEvent(self, event):
         self._drag_button = None
         self._last_pos = None
+        self._ctrl_drag_slice_id = None
 
     def mouseMoveEvent(self, event):
         if self._last_pos is None:
@@ -330,26 +352,36 @@ class NebulaWindow(QWindow):
         dy = float(pos.y() - self._last_pos.y())
         self._last_pos = pos
 
-        want_move = self.move_mode or bool(event.modifiers() & Qt.ControlModifier)
-        if want_move and self.active_slice_id is not None and self.active_slice_id in self._slices:
-            axis, _old_index = self._slices[self.active_slice_id]
+        ctrl_held = bool(event.modifiers() & Qt.ControlModifier)
+        if ctrl_held:
+            # Ctrl+arrastar sempre mexe na fatia que está embaixo do cursor
+            # (descoberta no mousePressEvent), independente da combobox.
+            target_slice_id = self._ctrl_drag_slice_id
+        elif self.move_mode:
+            # Botão "Mover" da toolbar: usa a fatia selecionada na combobox
+            # (igual o fluxo do Andromeda).
+            target_slice_id = self.active_slice_id
+        else:
+            target_slice_id = None
+
+        if target_slice_id is not None and target_slice_id in self._slices:
+            axis, _old_index = self._slices[target_slice_id]
             if self._mode == "orbit":
                 # Projeta a direção do eixo de movimento da fatia (em
                 # coordenadas de mundo, sob a câmera atual) pra tela, e usa a
                 # componente do arrasto alinhada com essa direção — arrastar
                 # "ao longo" do eixo do grid avança a fatia de verdade,
                 # arrastar perpendicular não faz quase nada.
-                new_index = renderer.nudge_slice(self.active_slice_id, dx, dy)
+                new_index = renderer.nudge_slice(target_slice_id, dx, dy)
             else:
-                # Visão 2D: a fatia ativa aparece de frente, então "mover ao
-                # longo do eixo" é ir pra dentro/fora da tela — não existe
-                # direção de arrasto pra projetar, então usa dy direto.
-                _axis, index = self._slices[self.active_slice_id]
-                new_index = min(1.0, max(0.0, index + dy * 0.002))
-                renderer.set_slice_axis_index(self.active_slice_id, axis, new_index)
-            self._slices[self.active_slice_id] = (axis, new_index)
+                # Visão 2D: a fatia aparece de frente, então "mover ao longo
+                # do eixo" é ir pra dentro/fora da tela — não existe direção
+                # de arrasto pra projetar, então usa dy direto.
+                new_index = min(1.0, max(0.0, self._slices[target_slice_id][1] + dy * 0.002))
+                renderer.set_slice_axis_index(target_slice_id, axis, new_index)
+            self._slices[target_slice_id] = (axis, new_index)
             if self.on_slice_changed is not None:
-                self.on_slice_changed(self.active_slice_id, axis, new_index)
+                self.on_slice_changed(target_slice_id, axis, new_index)
             return
 
         if self._mode == "panzoom":
@@ -559,6 +591,19 @@ def build_slices_toolbar(main_win: QMainWindow, render_window: "NebulaWindow", o
     move_action.setCheckable(True)
     move_action.toggled.connect(render_window.set_move_mode)
     toolbar.addAction(move_action)
+
+    toolbar.addSeparator()
+
+    # Opacidade do volume — igual o Andromeda deixa o usuário ajustar, mas
+    # começa em 100% (totalmente opaco).
+    toolbar.addWidget(QLabel("Opacidade:"))
+    opacity_slider = QSlider(Qt.Horizontal)
+    opacity_slider.setMinimum(0)
+    opacity_slider.setMaximum(100)
+    opacity_slider.setValue(100)
+    opacity_slider.setMaximumWidth(120)
+    opacity_slider.valueChanged.connect(lambda v: render_window.set_volume_opacity(v / 100.0))
+    toolbar.addWidget(opacity_slider)
 
     toolbar.addSeparator()
 
