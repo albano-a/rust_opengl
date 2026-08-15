@@ -7,8 +7,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use crate::renderer::Renderer;
-use crate::spatial::{slice_model_matrix, slice_move_axis, volume_placement_matrix};
-use crate::uniforms::SliceParamsUniform;
+use super::spatial::{slice_model_matrix, slice_move_axis, volume_placement_matrix};
+use super::uniforms::SliceParamsUniform;
 
 /// Uma fatia (AxisAlignedImage) de um volume específico: qual eixo (Inline/
 /// Crossline/Time) e em que posição normalizada (0..1, relativa ao próprio
@@ -43,7 +43,7 @@ impl Renderer {
     fn add_slice(&mut self, slice_id: u64, volume_id: u64, axis: u32, index: f32) -> PyResult<()> {
         if !self.volumes.contains_key(&volume_id) {
             return Err(PyRuntimeError::new_err(format!(
-                "volume {volume_id} não encontrado"
+                "volume {volume_id} not found"
             )));
         }
 
@@ -93,7 +93,7 @@ impl Renderer {
         let slice = self
             .slices
             .get_mut(&slice_id)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("slice {slice_id} não encontrada")))?;
+            .ok_or_else(|| PyRuntimeError::new_err(format!("slice {slice_id} not found")))?;
         slice.visible = visible;
         Ok(())
     }
@@ -105,7 +105,7 @@ impl Renderer {
     fn set_slice_axis_index(&mut self, slice_id: u64, axis: u32, index: f32) -> PyResult<()> {
         if !self.slices.contains_key(&slice_id) {
             return Err(PyRuntimeError::new_err(format!(
-                "slice {slice_id} não encontrada"
+                "slice {slice_id} not found"
             )));
         }
         let index = index.clamp(0.0, 1.0);
@@ -130,7 +130,7 @@ impl Renderer {
     fn nudge_slice(&mut self, slice_id: u64, screen_dx: f32, screen_dy: f32) -> PyResult<f32> {
         let (volume_id, axis, index, model) = {
             let slice = self.slices.get(&slice_id).ok_or_else(|| {
-                PyRuntimeError::new_err(format!("slice {slice_id} não encontrada"))
+                PyRuntimeError::new_err(format!("slice {slice_id} not found"))
             })?;
             (slice.volume_id, slice.axis, slice.index, slice.model)
         };

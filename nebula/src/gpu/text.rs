@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 
-use crate::font;
+use crate::gpu::font;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]

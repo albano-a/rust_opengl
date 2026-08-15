@@ -7,12 +7,12 @@ use glam::Vec3;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use crate::camera::CameraKind;
-use crate::geometry::LineVertex;
+use crate::gpu::camera::CameraKind;
+use crate::gpu::geometry::LineVertex;
+use crate::gpu::text::build_text_mesh;
 use crate::renderer::Renderer;
-use crate::spatial::axis_grid_point;
-use crate::text::build_text_mesh;
-use crate::uniforms::TextParamsUniform;
+use super::spatial::axis_grid_point;
+use super::uniforms::TextParamsUniform;
 
 // Tamanho dos labels do grid de eixo (INLINE/CROSSLINE/TIME + valores dos
 // ticks) — dois lugares únicos pra ajustar, em vez de mexer em cada chamada
@@ -91,7 +91,7 @@ impl Renderer {
         let label = self
             .text_labels
             .get_mut(&id)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("label {id} não encontrado")))?;
+            .ok_or_else(|| PyRuntimeError::new_err(format!("label {id} not found")))?;
         label.visible = visible;
         Ok(())
     }
@@ -102,7 +102,7 @@ impl Renderer {
         let label = self
             .text_labels
             .get(&id)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("label {id} não encontrado")))?;
+            .ok_or_else(|| PyRuntimeError::new_err(format!("label {id} not found")))?;
         // A escala já gravada no uniform precisa ser preservada — não temos
         // ela guardada à parte, então relemos não é possível sem um readback
         // da GPU; como só x/y/z mudam aqui, reescrevemos só os 3 primeiros
@@ -130,7 +130,7 @@ impl Renderer {
             }
         }
 
-        const AXIS_NAMES: [&str; 3] = ["Inline", "Crossline", "Time"];
+        const AXIS_NAMES: [&str; 3] = ["IL", "XL", "ZL"];
         const AXIS_COLORS: [(f32, f32, f32); 3] = [
             AXIS_INLINE_COLOR, // #dc5050
             AXIS_XLINE_COLOR,  // #50c878

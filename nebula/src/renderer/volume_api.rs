@@ -8,10 +8,10 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use crate::colormap::Colormap;
-use crate::gpu_setup::VOLUME_FILTERABLE;
+use crate::gpu::colormap::Colormap;
+use crate::gpu::volume::Volume3D;
 use crate::renderer::Renderer;
-use crate::volume::Volume3D;
+use super::gpu_setup::VOLUME_FILTERABLE;
 
 /// Um volume carregado na GPU (textura 3D) junto com o colormap/clim usados
 /// pra colori-lo. Um `Renderer` pode ter vários, cada um com seu próprio id
@@ -54,13 +54,13 @@ impl Renderer {
         let expected = (width as usize) * (height as usize) * (depth as usize);
         if data.item_count() != expected {
             return Err(PyRuntimeError::new_err(format!(
-                "esperava {expected} elementos ({width}x{height}x{depth}), recebi {}",
+                "expected {expected} elements ({width}x{height}x{depth}), received {}",
                 data.item_count()
             )));
         }
 
         let values = Python::attach(|py| data.to_vec(py))
-            .map_err(|e| PyRuntimeError::new_err(format!("falha ao ler o buffer: {e}")))?;
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to read buffer: {e}")))?;
 
         let volume = Volume3D::upload(
             &self.device,
@@ -150,7 +150,7 @@ impl Renderer {
             let entry = self
                 .volumes
                 .get_mut(&id)
-                .ok_or_else(|| PyRuntimeError::new_err(format!("volume {id} não encontrado")))?;
+                .ok_or_else(|| PyRuntimeError::new_err(format!("volume {id} not found")))?;
             entry.origin = Vec3::new(origin_inline, origin_crossline, origin_time);
             entry.extent = Vec3::new(extent_inline, extent_crossline, extent_time);
         }
@@ -180,16 +180,16 @@ impl Renderer {
     fn set_volume_colormap(&mut self, id: u64, rgba: PyBuffer<u8>, discrete: bool) -> PyResult<()> {
         if rgba.item_count() % 4 != 0 {
             return Err(PyRuntimeError::new_err(
-                "rgba precisa ter um múltiplo de 4 elementos (N cores RGBA)",
+                "rgba must have a multiple of 4 elements (N RGBA colors)",
             ));
         }
         let entry = self
             .volumes
             .get_mut(&id)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("volume {id} não encontrado")))?;
+            .ok_or_else(|| PyRuntimeError::new_err(format!("volume {id} not found")))?;
 
         let bytes = Python::attach(|py| rgba.to_vec(py))
-            .map_err(|e| PyRuntimeError::new_err(format!("falha ao ler o buffer: {e}")))?;
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to read buffer: {e}")))?;
 
         entry.colormap = Colormap::upload(
             &self.device,
@@ -210,7 +210,7 @@ impl Renderer {
         let entry = self
             .volumes
             .get_mut(&id)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("volume {id} não encontrado")))?;
+            .ok_or_else(|| PyRuntimeError::new_err(format!("volume {id} not found")))?;
         entry.clim = (min, max);
         entry.colormap.set_clim(&self.queue, entry.clim);
         Ok(())
@@ -222,7 +222,7 @@ impl Renderer {
         let entry = self
             .volumes
             .get_mut(&id)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("volume {id} não encontrado")))?;
+            .ok_or_else(|| PyRuntimeError::new_err(format!("volume {id} not found")))?;
         entry.colormap.set_opacity(&self.queue, opacity);
         Ok(())
     }

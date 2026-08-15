@@ -2,11 +2,10 @@
 //! — extraído de `Renderer::new()` (que já era gigante só de boilerplate
 //! wgpu) pra cada pipeline ficar isolado e legível separadamente.
 
-use geometry::{LineVertex, SliceVertex};
-use text::TextVertex;
+use crate::gpu::geometry::{LineVertex, SliceVertex};
+use crate::gpu::text::TextVertex;
 
-use crate::gpu_setup::{DEPTH_FORMAT, VOLUME_FILTERABLE};
-use crate::{geometry, text};
+use super::gpu_setup::{DEPTH_FORMAT, VOLUME_FILTERABLE};
 
 pub(crate) fn create_scene_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -164,7 +163,7 @@ pub(crate) fn create_slice_pipeline(
 ) -> wgpu::RenderPipeline {
     let slice_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("volume_slice_shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("volume_slice.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/volume_slice.wgsl").into()),
     });
 
     let slice_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -233,7 +232,7 @@ pub(crate) fn create_wireframe_pipeline(
 ) -> wgpu::RenderPipeline {
     let wireframe_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("wireframe_shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("wireframe.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/wireframe.wgsl").into()),
     });
 
     let wireframe_pipeline_layout =
@@ -300,7 +299,7 @@ pub(crate) fn create_text_pipeline(
 ) -> wgpu::RenderPipeline {
     let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("text_shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("text.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/text.wgsl").into()),
     });
 
     let text_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {

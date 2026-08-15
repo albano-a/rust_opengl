@@ -11,6 +11,14 @@
 //! aqui (ciclo de vida principal); volumes em `volume_api.rs`; fatias em
 //! `slice_api.rs`; texto/grid de eixo em `text_api.rs`.
 
+mod gpu_setup;
+mod pipelines;
+mod slice_api;
+mod spatial;
+mod text_api;
+mod uniforms;
+mod volume_api;
+
 use std::collections::HashMap;
 use std::num::NonZeroIsize;
 
@@ -21,25 +29,22 @@ use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle,
 };
 
-use crate::camera::{CameraKind, OrbitCamera, PanZoomCamera};
-use crate::geometry::{SLICE_INDICES, SLICE_VERTICES, WIREFRAME_INDICES, WIREFRAME_VERTICES};
-use crate::gpu_setup::{
-    DEPTH_FORMAT, best_common_sample_count, create_depth_view, create_msaa_color_view,
-};
-use crate::pipelines;
-use crate::slice_api::SliceEntry;
-use crate::text::FontAtlas;
-use crate::text_api::AxisGridConfig;
-use crate::text_api::TextLabelEntry;
-use crate::uniforms::SceneUniform;
-use crate::volume_api::VolumeEntry;
+use crate::gpu::camera::{CameraKind, OrbitCamera, PanZoomCamera};
+use crate::gpu::geometry::{SLICE_INDICES, SLICE_VERTICES, WIREFRAME_INDICES, WIREFRAME_VERTICES};
+use crate::gpu::text::FontAtlas;
+use gpu_setup::{DEPTH_FORMAT, best_common_sample_count, create_depth_view, create_msaa_color_view};
+use slice_api::SliceEntry;
+use text_api::AxisGridConfig;
+use text_api::TextLabelEntry;
+use uniforms::SceneUniform;
+use volume_api::VolumeEntry;
 
 // Capacidade do buffer dinâmico dos traços curtos de tick (uma linha por
 // tick, 2 vértices cada) — recalculado a cada frame conforme a câmera gira.
 // `AXIS_TICK_COUNT` mora em `text_api.rs` (é config do grid de eixo), mas o
 // buffer é alocado aqui em `new()` junto com o resto dos buffers da GPU.
 pub(crate) const AXIS_TICK_LINE_CAPACITY: usize =
-    (crate::text_api::AXIS_TICK_COUNT as usize) * 3 * 2;
+    (text_api::AXIS_TICK_COUNT as usize) * 3 * 2;
 
 #[pyclass]
 pub(crate) struct Renderer {
@@ -108,7 +113,7 @@ impl Renderer {
     #[new]
     fn new(hwnd: isize, width: u32, height: u32, mode: String) -> PyResult<Self> {
         let hwnd = NonZeroIsize::new(hwnd)
-            .ok_or_else(|| PyRuntimeError::new_err("hwnd não pode ser zero"))?;
+            .ok_or_else(|| PyRuntimeError::new_err("hwnd cannot be zero"))?;
 
         let mut win32_handle = Win32WindowHandle::new(hwnd);
         win32_handle.hinstance = None;
@@ -125,7 +130,7 @@ impl Renderer {
                     raw_display_handle: Some(raw_display_handle),
                     raw_window_handle,
                 })
-                .map_err(|e| PyRuntimeError::new_err(format!("falha ao criar surface: {e}")))?
+                .map_err(|e| PyRuntimeError::new_err(format!("failed to create surface: {e}")))?
         };
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -134,7 +139,7 @@ impl Renderer {
             force_fallback_adapter: false,
             ..Default::default()
         }))
-        .map_err(|e| PyRuntimeError::new_err(format!("nenhum adapter wgpu disponível: {e}")))?;
+        .map_err(|e| PyRuntimeError::new_err(format!("no wgpu adapter available: {e}")))?;
 
         // Sem essa feature, o wgpu só garante os sample counts do spec da
         // WebGPU ([1,4]) mesmo em adapters cujo hardware suporta mais (8x,
@@ -155,19 +160,19 @@ impl Renderer {
             trace: wgpu::Trace::Off,
             ..Default::default()
         }))
-        .map_err(|e| PyRuntimeError::new_err(format!("falha ao criar device: {e}")))?;
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to create device: {e}")))?;
 
         // Por padrão, um erro de validação não capturado faz o wgpu chamar panic!()
         // no processo inteiro (derrubando o interpretador Python junto). Isso acontece
         // de forma inofensiva durante o teardown da janela (ex: um resize chega depois
         // do HWND já ter sido destruído pelo Qt) — aqui só logamos em vez de crashar.
         device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
-            eprintln!("[nebula] erro wgpu não capturado (ignorado): {error}");
+            eprintln!("[nebula] uncaptured wgpu error (ignored): {error}");
         }));
 
         let config = surface
             .get_default_config(&adapter, width.max(1), height.max(1))
-            .ok_or_else(|| PyRuntimeError::new_err("surface incompatível com o adapter"))?;
+            .ok_or_else(|| PyRuntimeError::new_err("surface incompatible with adapter"))?;
         let surface_format = config.format;
         surface.configure(&device, &config);
 
@@ -296,7 +301,7 @@ impl Renderer {
         // por frame só porque o usuário orbitou a câmera.
         let axis_tick_lines_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("axis_tick_lines_buffer"),
-            size: (AXIS_TICK_LINE_CAPACITY * std::mem::size_of::<crate::geometry::LineVertex>())
+            size: (AXIS_TICK_LINE_CAPACITY * std::mem::size_of::<crate::gpu::geometry::LineVertex>())
                 as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -379,7 +384,7 @@ impl Renderer {
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 return Err(PyRuntimeError::new_err(
-                    "erro de validação ao obter frame da surface",
+                    "validation error getting surface frame",
                 ));
             }
         };
