@@ -176,6 +176,53 @@ qualquer ângulo, não simular iluminação realista. Corrigido pra:
 clara/legível na nova direção de visão, com o gradiente de sombra mudando de lado — luz
 seguindo a câmera, exatamente o comportamento do Petrel usado como referência.
 
+## Fase 3.7 — Colormap contínuo (concluída)
+
+Escopo: só colormap **contínuo** (amplitude sísmica, atributos elásticos). LUT **categórica**
+(facies, código→cor exata) fica de fora — isso é resolvido no lado VisPy do LogPlot Vision, que
+continua existindo separado do Nebula.
+
+- [x] `nebula/src/colormap.rs`: `Colormap` — textura 1D `Rgba8Unorm` (filtrável em qualquer
+      hardware, sem a dor de cabeça do `FLOAT32_FILTERABLE` que tivemos com o volume na Fase 3),
+      sampler `Linear` (colormap contínuo deve interpolar), e um uniform de `clim` (`vec4`,
+      só `x`/`y` usados) — tudo num bind group próprio (`@group(2)`), **separado** do bind group
+      do volume: trocar de colormap ou ajustar `clim` não deveria exigir recriar a textura 3D,
+      e vice-versa (ciclos de vida independentes)
+- [x] `Renderer::set_colormap(rgba: PyBuffer<u8>)` — recebe uma tabela RGBA `(N, 4)` já pronta.
+      O Nebula não sabe nada sobre matplotlib/VisPy/Petrel/Paradigm: o lado Python amostra
+      qualquer colormap (nome do matplotlib, ou objeto `vispy.color.Colormap` já convertido de
+      Petrel/Paradigm no Andromeda) em N pontos fixos e manda a tabela pronta — mesmo contrato
+      do `load_volume` (Python prepara o dado, Rust só sobe pra GPU)
+- [x] `Renderer::set_clim(min, max)` — só reescreve o uniform, não recria a textura
+- [x] Shader: `raw_value` do volume normalizado por `clim` vira índice de busca na LUT
+      (`textureSample(colormap_texture, ..., t).rgb`), e esse RGB substitui o cinza como
+      `albedo` que entra na iluminação
+- [x] `python/embed_test.py`: `build_colormap_lut(name, resolution=256)` amostra qualquer
+      colormap contínuo do matplotlib; `COLORMAP_NAME` no topo do arquivo é o único lugar que
+      precisa mudar pra testar outro (`"jet"`, `"gray_r"`, `"seismic"`, etc. — mesmos nomes já
+      usados no Andromeda hoje)
+- [x] `build_seismic_volume` (novo `pattern="seismic"`): refletores em camadas (mergulho +
+      dobra suaves, aleatórios por camada) convolvidos com uma wavelet de Ricker ao longo de Z
+      — o mesmo princípio (refletividade × wavelet) de modelagem sísmica convolucional real,
+      só sem física de propagação de onda. Bem mais convincente pra validar colormap +
+      iluminação juntos do que o xadrez.
+- [x] Corrigido o eixo da fatia amostrada: era uma fatia horizontal fixa em Z (`w = 0.5`, um
+      "time-slice"), que não mostra a cara clássica de seção sísmica porque as camadas
+      onduladas só aparecem numa seção **vertical**. Trocado pra fatiar na crossline do meio
+      (`v = 0.5`, eixo X do quad = inline, eixo Y do quad = profundidade) — assim as camadas
+      ficam visíveis como as ondulações típicas de uma seção real.
+- [x] Câmera padrão normalizada pra crossline: `OrbitCamera::new` usava `azimuth=45°,
+      elevation=30°` (bom pro cubo genérico da Fase 2), o que deixava a seção sísmica com cara
+      de trapézio — vista de esguelha por padrão, mesmo depois de corrigir o eixo da fatia.
+      Trocado pra `azimuth=0, elevation=0`: olha reto pro eixo Z do mundo, que é exatamente a
+      direção perpendicular ao quad de seção (fatiado na crossline). Orbit continua livre pro
+      usuário girar se quiser.
+
+**Critério de saída**: confirmado visualmente — com `pattern="seismic"` + `viridis`, a seção
+aparece retangular (sem distorção de perspectiva), de frente, mostrando camadas onduladas
+coloridas (bandas roxo/amarelo sobre fundo verde-água) com mergulho e dobra visíveis, iluminação
+(Fase 3.5) ainda aplicada corretamente por cima da cor.
+
 ## Fases seguintes
 
 4. **Volume rendering**: ray marching no fragment/compute shader, transfer functions,
