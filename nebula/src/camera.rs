@@ -86,6 +86,18 @@ impl OrbitCamera {
     pub fn set_aspect(&mut self, aspect: f32) {
         self.aspect = aspect.max(0.01);
     }
+
+    /// Eixos "direita"/"cima" da câmera em coordenadas de mundo — usados pra
+    /// billboard de texto (o quad de cada caractere sempre de frente pra
+    /// tela, não pro objeto). Mesma conta do `pan()`, só devolvida em vez de
+    /// aplicada.
+    pub fn basis(&self) -> (Vec3, Vec3) {
+        let eye = self.eye();
+        let forward = (self.target - eye).normalize();
+        let right = forward.cross(Vec3::Y).normalize();
+        let up = right.cross(forward).normalize();
+        (right, up)
+    }
 }
 
 /// Câmera 2D (pan + zoom, sem rotação), equivalente ao `PanZoomCamera` do
@@ -133,6 +145,11 @@ impl PanZoomCamera {
     pub fn set_aspect(&mut self, aspect: f32) {
         self.aspect = aspect.max(0.01);
     }
+
+    /// Câmera ortográfica nunca inclina — eixos fixos do mundo.
+    pub fn basis(&self) -> (Vec3, Vec3) {
+        (Vec3::X, Vec3::Y)
+    }
 }
 
 /// As duas câmeras que o Nebula suporta hoje: orbital (visão 3D, com luz) e
@@ -162,6 +179,13 @@ impl CameraKind {
         match self {
             CameraKind::Orbit(c) => c.set_aspect(aspect),
             CameraKind::PanZoom(c) => c.set_aspect(aspect),
+        }
+    }
+
+    pub fn basis(&self) -> (Vec3, Vec3) {
+        match self {
+            CameraKind::Orbit(c) => c.basis(),
+            CameraKind::PanZoom(c) => c.basis(),
         }
     }
 

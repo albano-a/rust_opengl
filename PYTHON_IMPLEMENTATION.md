@@ -235,68 +235,55 @@ render_window.mousePressEvent(event)
 Isso exercita exatamente o mesmo caminho de código que um usuário real dispara, sem depender de
 nenhuma sincronização de SO.
 
-## 5. Overlays 2D sobre o canvas (colorbar, labels, HUD)
+## 5. Texto e overlays sobre o canvas (labels, colorbar, HUD)
 
-O Nebula **não sabe renderizar texto** — de propósito, pra não precisar de um sistema de
-fonte/atlas em wgpu. Qualquer overlay textual (colorbar, labels de eixo, nome de poço, bússola)
-é responsabilidade do Qt, usando `Renderer.project_to_screen(x, y, z)` pra saber onde posicionar
-cada elemento:
+**Texto é nativo do Nebula** — não peça ao Qt pra desenhar texto posicionado no espaço 3D. O
+Rust tem uma fonte bitmap embutida (sem nenhuma dependência externa) e desenha os labels como
+geometria de verdade (billboards sempre de frente pra câmera), via `add_text_label`:
 
 ```python
-screen = renderer.project_to_screen(x, y, z)  # None se o ponto está atrás da câmera
-if screen is not None:
-    sx, sy = screen
-    label.move(int(sx) - label.width() // 2, int(sy) - label.height() // 2)
+renderer.add_text_label(
+    id, x, y, z,      # posição no mundo (convenção do cubo -1..1: X=Inline, Y=Time, Z=Crossline)
+    "IL 970\nXL 1650", # \n quebra linha
+    0.5, 0.83, 1.0,    # cor (r, g, b), 0..1
+    0.14,              # escala
+)
 ```
 
-`x, y, z` usam a convenção espacial fixa do cubo (`-1..1`, mundo X=Inline, Y=Time, Z=Crossline)
-— pra posicionar algo em coordenadas de survey reais, converta pra essa faixa normalizada
-primeiro (mesmo cálculo do `index` normalizado da seção 4).
+Uma vez adicionado, o label acompanha orbit/pan/zoom **sozinho** — não precisa recalcular
+posição de tela a cada frame do lado Python, porque não é um overlay 2D, é geometria real da
+cena. `remove_text_label(id)`, `set_text_label_visible(id, bool)` e
+`set_text_label_position(id, x, y, z)` completam a API. Fonte cobre A-Z, 0-9 e pontuação básica
+(`- . : / _` e espaço); minúsculas são tratadas como maiúsculas automaticamente.
 
-### Armadilha séria: overlays sobre `createWindowContainer`
+Isso cobre labels de eixo, nome de poço, qualquer anotação 3D — não é preciso (nem recomendado)
+recriar o padrão de overlay Qt abaixo pra texto. A colorbar continua sendo `QPainter` puro (ver
+`ColorbarWidget`), porque ela fica **ao lado** do canvas no layout, não por cima — não é overlay.
 
-`createWindowContainer` embute uma janela nativa de verdade. Widgets Qt comuns, mesmo sendo
-filhos diretos do widget container, **não compõem visualmente por cima dela** — é uma limitação
-conhecida do Qt. A saída "óbvia" seria `label.setAttribute(Qt.WA_AlwaysStackOnTop)`, e ela até
+### Se algum dia precisar de um overlay Qt de verdade (não-texto) sobre o canvas
+
+`Renderer.project_to_screen(x, y, z)` (mundo → tela) ainda existe pra esse caso raro — algo que
+precise ser um `QWidget` interativo de verdade posicionado sobre a cena 3D (não é o caso de
+texto, que já é nativo). Duas armadilhas documentadas aqui porque custaram tempo real de debug:
+
+**`createWindowContainer` embute uma janela nativa de verdade.** Widgets Qt comuns, mesmo sendo
+filhos diretos do widget container, **não compõem visualmente por cima dela** — limitação
+conhecida do Qt. A saída "óbvia" seria `widget.setAttribute(Qt.WA_AlwaysStackOnTop)`, e ela até
 resolve visualmente... **mas derruba o processo** nesta combinação específica (`wgpu::Surface`
 criada a partir de um HWND cru + Qt tentando promover o widget a janela nativa própria — conflito
-não totalmente diagnosticado, mas reproduzido de forma consistente).
+não totalmente diagnosticado, mas reproduzido de forma consistente). Se algum overlay não-texto
+for mesmo necessário, use uma janela `Tool` separada em vez disso (sempre no topo, sem foco,
+`WA_TransparentForMouseEvents` pra não atrapalhar orbit/pan/zoom por baixo, reposicionada
+manualmente pra cobrir o canvas a cada frame via `container.mapToGlobal(QPoint(0,0))`) — técnica
+que funcionou sem crash quando os labels de eixo ainda eram Qt (antes de virarem nativos), mas
+hoje só vale a pena se for um widget interativo de verdade, não texto estático.
 
-A solução estável, testada e sem crash: uma **janela `Tool` separada**, sempre no topo, sem foco,
-transparente a eventos de mouse (pra não atrapalhar orbit/pan/zoom do canvas por baixo),
-reposicionada manualmente pra cobrir a área do canvas a cada frame:
-
-```python
-overlay = QWidget(
-    container.window(),
-    Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus,
-)
-overlay.setAttribute(Qt.WA_TranslucentBackground)
-overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
-overlay.setStyleSheet("background: transparent;")
-overlay.show()
-
-label = QLabel("...", overlay)  # os labels são filhos do overlay, não do container
-
-# a cada frame (ex: dentro do tick() do QTimer):
-top_left = container.mapToGlobal(QPoint(0, 0))
-overlay.setGeometry(top_left.x(), top_left.y(), container.width(), container.height())
-```
-
-Essa é a técnica padrão do Qt pra overlay sobre widgets nativos/OpenGL, e é o que
-`EdgeLabelsOverlay`/`ColorbarWidget` usam hoje. `ColorbarWidget` em particular nem precisa dessa
-técnica — ele fica ao lado do canvas no layout, não por cima, então é um `QWidget` comum,
-pintado com `QPainter` a partir do mesmo array `(N,4)` do colormap.
-
-### Se uma feature de overlay parecer "invisível" ao testar
-
-Se você estiver validando via captura de tela automatizada (`PrintWindow` do Win32, comum em
-scripts de screenshot), saiba que ele **só captura o conteúdo de um HWND específico** — não vê
-outras janelas de nível superior compostas por cima dela pelo Windows (exatamente o caso da
-janela-`Tool` acima). Uma feature pode estar renderizando perfeitamente e ainda assim não
-aparecer numa captura via `PrintWindow`. Pra confirmar de verdade, use uma captura de tela real
-(`Graphics.CopyFromScreen` no .NET/PowerShell, ou qualquer ferramenta que capture o desktop
-composto) em vez de `PrintWindow`.
+**`PrintWindow` (Win32) só captura o conteúdo de um HWND específico** — não vê outras janelas de
+nível superior compostas por cima dela pelo Windows (o caso da janela-`Tool` acima). Se estiver
+validando algo assim via captura de tela automatizada e a feature parecer "invisível" mesmo sem
+erro nenhum, confirme com uma captura de tela real (`Graphics.CopyFromScreen`) antes de assumir
+bug. Não se aplica a texto nativo — ele é geometria normal dentro do mesmo HWND do canvas,
+captura em qualquer método de screenshot.
 
 ## 6. Mapeamento pros managers existentes do Andromeda
 

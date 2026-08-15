@@ -8,6 +8,8 @@ struct SceneUniform {
     light_position: vec4<f32>,
     camera_position: vec4<f32>,
     flags: vec4<f32>,
+    camera_right: vec4<f32>,
+    camera_up: vec4<f32>,
 };
 
 @group(0) @binding(0)

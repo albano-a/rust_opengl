@@ -21,7 +21,7 @@ import time
 
 import matplotlib
 import numpy as np
-from PyQt5.QtCore import QPoint, Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QLinearGradient, QPainter, QWindow
 from PyQt5.QtWidgets import (
     QAction,
@@ -268,6 +268,12 @@ class NebulaWindow(QWindow):
         # primeira render_frame() depois que o Renderer existe.
         self._slices = {}
         self._slices_added = set()
+        # label_id -> (x, y, z, text, color, scale); adicionados de verdade
+        # no Rust (texto GPU nativo, `Renderer.add_text_label`) na primeira
+        # render_frame() depois que o Renderer existe — mesmo padrão "pendente"
+        # das fatias.
+        self._text_labels = {}
+        self._text_labels_added = set()
         self.active_slice_id = None
         self.move_mode = False
         # Fatia descoberta debaixo do cursor no início de um Ctrl+arrastar
@@ -318,13 +324,24 @@ class NebulaWindow(QWindow):
 
     def project_to_screen(self, x: float, y: float, z: float):
         """Projeta um ponto do cubo (-1..1, mesma convenção do wireframe) pra
-        coordenada de tela sob a câmera atual — usado pelos labels de eixo
-        (`EdgeLabelsOverlay`) pra se posicionar sem o Nebula saber desenhar
-        texto. Devolve `None` se o Renderer ainda não existe ou o ponto está
-        atrás da câmera."""
+        coordenada de tela sob a câmera atual — só útil hoje pra overlays Qt
+        que não sejam texto (o texto em si já é nativo do Nebula, ver
+        `add_text_label`). Devolve `None` se o Renderer ainda não existe ou o
+        ponto está atrás da câmera."""
         if self._renderer is None:
             return None
         return self._renderer.project_to_screen(x, y, z)
+
+    def add_text_label(self, label_id, x: float, y: float, z: float, text: str, color=(0.5, 0.83, 1.0), scale: float = 0.12):
+        """Label de texto GPU nativo (billboard 3D, fonte bitmap embutida no
+        Nebula) — nada de widget Qt sobreposto: fica de verdade no espaço 3D,
+        acompanha orbit/pan/zoom sozinho, sem precisar recalcular posição de
+        tela a cada frame do lado Python."""
+        self._text_labels[label_id] = (x, y, z, text, color, scale)
+        renderer = self._renderer
+        if renderer is not None and label_id in self._text_labels_added:
+            renderer.remove_text_label(label_id)
+            self._text_labels_added.discard(label_id)
 
     def shutdown(self):
         # Chamado antes do Qt começar a destruir a janela nativa: depois disso,
@@ -373,6 +390,12 @@ class NebulaWindow(QWindow):
             if slice_id not in self._slices_added:
                 renderer.add_slice(slice_id, 0, axis, index)
                 self._slices_added.add(slice_id)
+
+        for label_id, (x, y, z, text, color, scale) in self._text_labels.items():
+            if label_id not in self._text_labels_added:
+                r, g, b = color
+                renderer.add_text_label(label_id, x, y, z, text, r, g, b, scale)
+                self._text_labels_added.add(label_id)
 
         renderer.render()
 
@@ -510,81 +533,25 @@ class ColorbarWidget(QWidget):
             painter.drawText(bar_rect.right() + 6, y + 4, f"{value:.2f}")
 
 
-class EdgeLabelsOverlay:
-    """Labels de eixo (IL/XL/Time) nos cantos do wireframe do cubo — o que
-    faltava pro cubo 3D bater com a referência do Petrel/Ocean (que numera os
-    cantos da caixa). Reposicionados a cada frame via
-    `NebulaWindow.project_to_screen` — o Nebula continua sem saber nada sobre
-    renderizar texto (mesma decisão do `ColorbarWidget` e do plano futuro pro
-    nome da cabeça do poço na Fase 5).
-
-    `createWindowContainer` embute uma janela nativa de verdade; widgets Qt
-    comuns filhos do container não compõem por cima dela (limitação
-    conhecida), e forçar isso com `Qt.WA_AlwaysStackOnTop` se mostrou
-    instável aqui (derrubou o processo, provavelmente por conflitar com a
-    `wgpu::Surface` criada a partir do HWND cru). Em vez disso, os labels
-    moram numa janela-`Tool` separada, sempre no topo, sem receber foco nem
-    eventos de mouse (`WA_TransparentForMouseEvents` — não pode atrapalhar
-    o orbit/pan/zoom do canvas por baixo), reposicionada manualmente pra
-    cobrir exatamente a área do canvas a cada frame — a técnica padrão pra
-    overlay sobre widgets nativos/OpenGL no Qt.
-
-    Convenção espacial (mesma do wireframe em `geometry.rs`/`lib.rs`): mundo
-    X = Inline, Y = Time (topo = raso), Z = Crossline, cubo unitário -1..1.
+def add_wireframe_edge_labels(render_window: "NebulaWindow", width: int, height: int, depth: int):
+    """Labels de eixo (IL/XL/Time) nos cantos do wireframe do cubo — texto GPU
+    nativo (`Renderer.add_text_label`), não mais um hack de overlay Qt por
+    cima do `createWindowContainer`. Convenção espacial (mesma do wireframe
+    em `geometry.rs`/`lib.rs`): mundo X = Inline, Y = Time (topo = raso),
+    Z = Crossline, cubo unitário -1..1. Os quatro cantos de cima levam IL/XL
+    combinados (igual o Petrel mostra "IL970/XL1650" junto no canto) e um
+    canto ganha também o Time — o outro extremo do Time fica sozinho no
+    canto de baixo correspondente.
     """
-
-    def __init__(self, render_window: "NebulaWindow", container: QWidget, width: int, height: int, depth: int):
-        self._render_window = render_window
-        self._container = container
-
-        self._overlay = QWidget(
-            container.window(),
-            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus,
-        )
-        self._overlay.setAttribute(Qt.WA_TranslucentBackground)
-        self._overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self._overlay.setStyleSheet("background: transparent;")
-        self._overlay.show()
-
-        # (texto, ponto no cubo -1..1). Os quatro cantos de cima levam
-        # IL/XL combinados (igual o Petrel mostra "IL970\nXL1650" junto no
-        # canto) e um canto ganha também o Time — o outro extremo do Time
-        # fica sozinho no canto de baixo correspondente.
-        self._anchors = [
-            ("IL 0\nXL 0\nT 0", (-1.0, 1.0, -1.0)),
-            (f"IL {width - 1}\nXL 0", (1.0, 1.0, -1.0)),
-            (f"IL {width - 1}\nXL {height - 1}", (1.0, 1.0, 1.0)),
-            (f"IL 0\nXL {height - 1}", (-1.0, 1.0, 1.0)),
-            (f"T {depth - 1}", (-1.0, -1.0, -1.0)),
-        ]
-
-        self._labels = []
-        for text, _point in self._anchors:
-            label = QLabel(text, self._overlay)
-            label.setStyleSheet(
-                "color: #7fd4ff; background: rgba(20,30,40,140); "
-                "padding: 2px 4px; font-size: 10px; font-weight: bold;"
-            )
-            label.adjustSize()
-            label.show()
-            self._labels.append(label)
-
-    def update_positions(self):
-        top_left = self._container.mapToGlobal(QPoint(0, 0))
-        self._overlay.setGeometry(top_left.x(), top_left.y(), self._container.width(), self._container.height())
-
-        for label, (_text, point) in zip(self._labels, self._anchors):
-            screen = self._render_window.project_to_screen(*point)
-            if screen is None:
-                label.hide()
-                continue
-            sx, sy = screen
-            # Fora da viewport (atrás/aos lados) não precisa desenhar.
-            if sx < -200 or sy < -200 or sx > self._container.width() + 200 or sy > self._container.height() + 200:
-                label.hide()
-                continue
-            label.show()
-            label.move(int(sx) - label.width() // 2, int(sy) - label.height() // 2)
+    anchors = [
+        (900, "IL 0\nXL 0\nT 0", (-1.0, 1.0, -1.0)),
+        (901, f"IL {width - 1}\nXL 0", (1.0, 1.0, -1.0)),
+        (902, f"IL {width - 1}\nXL {height - 1}", (1.0, 1.0, 1.0)),
+        (903, f"IL 0\nXL {height - 1}", (-1.0, 1.0, 1.0)),
+        (904, f"T {depth - 1}", (-1.0, -1.0, -1.0)),
+    ]
+    for label_id, text, (x, y, z) in anchors:
+        render_window.add_text_label(label_id, x, y, z, text, color=(0.5, 0.83, 1.0), scale=0.14)
 
 
 class Slice2DDialog(QDialog):
@@ -787,7 +754,7 @@ def main():
         active_slice_id=AXIS_INDEX["Crossline"],
     )
 
-    edge_labels = EdgeLabelsOverlay(render_window, container, volume_dim, volume_dim, volume_dim)
+    add_wireframe_edge_labels(render_window, volume_dim, volume_dim, volume_dim)
 
     tree_dock = QDockWidget("Object Tree", main_win)
     tree_dock.setWidget(build_object_tree())
@@ -809,7 +776,6 @@ def main():
 
     def tick():
         render_window.render_frame()
-        edge_labels.update_positions()
         fps_state["frames"] += 1
         now = time.perf_counter()
         elapsed = now - fps_state["last_time"]

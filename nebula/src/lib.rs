@@ -1,6 +1,8 @@
 mod camera;
 mod colormap;
+mod font;
 mod geometry;
+mod text;
 mod volume;
 
 use std::collections::HashMap;
@@ -18,6 +20,7 @@ use colormap::Colormap;
 use geometry::{
     LineVertex, SliceVertex, SLICE_INDICES, SLICE_VERTICES, WIREFRAME_INDICES, WIREFRAME_VERTICES,
 };
+use text::{build_text_mesh, FontAtlas, TextVertex};
 use volume::Volume3D;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -42,6 +45,10 @@ struct SceneUniform {
     // x = 1.0 aplica iluminação (visão 3D orbital), 0.0 não aplica (visão 2D
     // pan/zoom — seção é dado cru, não superfície lit).
     flags: [f32; 4],
+    // Eixos da câmera em coordenadas de mundo, usados pro billboard dos
+    // labels de texto (cada caractere sempre de frente pra tela).
+    camera_right: [f32; 4],
+    camera_up: [f32; 4],
 }
 
 #[repr(C)]
@@ -51,6 +58,15 @@ struct SliceParamsUniform {
     axis: u32,
     index: f32,
     _pad: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct TextParamsUniform {
+    // xyz = posição no mundo do centro do label; w = escala.
+    anchor_scale: [f32; 4],
+    // rgb = cor; a não usado.
+    color: [f32; 4],
 }
 
 // Convenção espacial do cubo sísmico (cubo unitário -1..1 em cada eixo,
@@ -113,6 +129,18 @@ struct SliceEntry {
     params_bind_group: wgpu::BindGroup,
 }
 
+/// Um label de texto (billboard) já tesselado — a malha (`vertex_buffer`/
+/// `index_buffer`) é construída uma vez a partir da string, na criação;
+/// mudar posição/cor/escala só reescreve `params_buffer`.
+struct TextLabelEntry {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
+    params_buffer: wgpu::Buffer,
+    params_bind_group: wgpu::BindGroup,
+    visible: bool,
+}
+
 fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth_texture"),
@@ -158,12 +186,17 @@ struct Renderer {
     wireframe_index_buffer: wgpu::Buffer,
     num_wireframe_indices: u32,
 
+    text_pipeline: wgpu::RenderPipeline,
+    text_params_bind_group_layout: wgpu::BindGroupLayout,
+    font_atlas: FontAtlas,
+
     volume_bind_group_layout: wgpu::BindGroupLayout,
     colormap_bind_group_layout: wgpu::BindGroupLayout,
     slice_params_bind_group_layout: wgpu::BindGroupLayout,
 
     volumes: HashMap<u64, VolumeEntry>,
     slices: HashMap<u64, SliceEntry>,
+    text_labels: HashMap<u64, TextLabelEntry>,
 }
 
 #[pymethods]
@@ -247,6 +280,7 @@ impl Renderer {
             });
 
         let initial_eye = camera.eye();
+        let (initial_right, initial_up) = camera.basis();
         let initial_scene_uniform = SceneUniform {
             view_proj: camera.view_proj().to_cols_array_2d(),
             model: Mat4::IDENTITY.to_cols_array_2d(),
@@ -256,6 +290,8 @@ impl Renderer {
             light_position: [initial_eye.x, initial_eye.y, initial_eye.z, 0.0],
             camera_position: [initial_eye.x, initial_eye.y, initial_eye.z, 0.0],
             flags: [camera.lighting_enabled(), 0.0, 0.0, 0.0],
+            camera_right: [initial_right.x, initial_right.y, initial_right.z, 0.0],
+            camera_up: [initial_up.x, initial_up.y, initial_up.z, 0.0],
         };
 
         let scene_buffer = wgpu::util::DeviceExt::create_buffer_init(
@@ -501,6 +537,100 @@ impl Renderer {
             },
         );
 
+        // Texto GPU nativo (labels de eixo, e futuramente nomes de poço):
+        // fonte bitmap embutida (`font.rs`), sem depender de nada do lado
+        // Python pra existir — o Nebula é dono do próprio texto.
+        let text_params_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("text_params_bind_group_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let font_atlas_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("font_atlas_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let font_atlas = FontAtlas::new(&device, &queue, &font_atlas_bind_group_layout);
+
+        let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("text_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("text.wgsl").into()),
+        });
+
+        let text_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("text_pipeline_layout"),
+            bind_group_layouts: &[
+                Some(&scene_bind_group_layout),
+                Some(&text_params_bind_group_layout),
+                Some(&font_atlas_bind_group_layout),
+            ],
+            immediate_size: 0,
+        });
+
+        let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("text_pipeline"),
+            layout: Some(&text_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &text_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Some(TextVertex::layout())],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &text_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            // Texto é anotação tipo HUD (igual o Petrel deixa os labels de
+            // eixo sempre legíveis) — sempre visível por cima de tudo, não
+            // ocluído pela geometria 3D. Sem escrever profundidade, pra não
+            // atrapalhar nada desenhado depois.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         Ok(Self {
             surface,
             device,
@@ -518,11 +648,15 @@ impl Renderer {
             wireframe_vertex_buffer,
             wireframe_index_buffer,
             num_wireframe_indices: WIREFRAME_INDICES.len() as u32,
+            text_pipeline,
+            text_params_bind_group_layout,
+            font_atlas,
             volume_bind_group_layout,
             colormap_bind_group_layout,
             slice_params_bind_group_layout,
             volumes: HashMap::new(),
             slices: HashMap::new(),
+            text_labels: HashMap::new(),
         })
     }
 
@@ -864,6 +998,99 @@ impl Renderer {
         Some((screen_x, screen_y))
     }
 
+    /// Adiciona um label de texto GPU nativo (billboard, sempre de frente
+    /// pra câmera) na posição `x,y,z` do mundo. `text` pode ter `\n` pra
+    /// várias linhas. `color` é `(r,g,b)` 0..1. `scale` controla o tamanho
+    /// (mesma unidade de mundo do cubo -1..1). Fonte bitmap embutida — não
+    /// precisa de nenhum setup prévio do lado Python.
+    #[allow(clippy::too_many_arguments)]
+    fn add_text_label(
+        &mut self,
+        id: u64,
+        x: f32,
+        y: f32,
+        z: f32,
+        text: String,
+        r: f32,
+        g: f32,
+        b: f32,
+        scale: f32,
+    ) {
+        let (vertices, indices) = build_text_mesh(&text);
+
+        let vertex_buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &self.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("text_vertex_buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        );
+        let index_buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &self.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("text_index_buffer"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            },
+        );
+
+        let params = TextParamsUniform { anchor_scale: [x, y, z, scale], color: [r, g, b, 1.0] };
+        let params_buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &self.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("text_params_buffer"),
+                contents: bytemuck::cast_slice(&[params]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            },
+        );
+        let params_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("text_params_bind_group"),
+            layout: &self.text_params_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() }],
+        });
+
+        self.text_labels.insert(
+            id,
+            TextLabelEntry {
+                vertex_buffer,
+                index_buffer,
+                num_indices: indices.len() as u32,
+                params_buffer,
+                params_bind_group,
+                visible: true,
+            },
+        );
+    }
+
+    fn remove_text_label(&mut self, id: u64) {
+        self.text_labels.remove(&id);
+    }
+
+    fn set_text_label_visible(&mut self, id: u64, visible: bool) -> PyResult<()> {
+        let label = self
+            .text_labels
+            .get_mut(&id)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("label {id} não encontrado")))?;
+        label.visible = visible;
+        Ok(())
+    }
+
+    /// Move um label já existente sem retesselar o texto (só reescreve o
+    /// uniform de posição/escala).
+    fn set_text_label_position(&mut self, id: u64, x: f32, y: f32, z: f32) -> PyResult<()> {
+        let label = self
+            .text_labels
+            .get(&id)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("label {id} não encontrado")))?;
+        // A escala já gravada no uniform precisa ser preservada — não temos
+        // ela guardada à parte, então relemos não é possível sem um readback
+        // da GPU; como só x/y/z mudam aqui, reescrevemos só os 3 primeiros
+        // floats do uniform (offset 0), deixando `scale` (offset 12) intacto.
+        self.queue.write_buffer(&label.params_buffer, 0, bytemuck::cast_slice(&[x, y, z]));
+        Ok(())
+    }
+
     fn render(&mut self) -> PyResult<()> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -886,6 +1113,7 @@ impl Renderer {
         // câmera ("headlight"), então o lado que você está olhando fica sempre
         // bem iluminado, do jeito que o Petrel faz.
         let eye = self.camera.eye();
+        let (right, up) = self.camera.basis();
 
         let scene_uniform = SceneUniform {
             view_proj: self.camera.view_proj().to_cols_array_2d(),
@@ -893,6 +1121,8 @@ impl Renderer {
             light_position: [eye.x, eye.y, eye.z, 0.0],
             camera_position: [eye.x, eye.y, eye.z, 0.0],
             flags: [self.camera.lighting_enabled(), 0.0, 0.0, 0.0],
+            camera_right: [right.x, right.y, right.z, 0.0],
+            camera_up: [up.x, up.y, up.z, 0.0],
         };
 
         self.queue
@@ -967,6 +1197,23 @@ impl Renderer {
             render_pass
                 .set_index_buffer(self.wireframe_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..self.num_wireframe_indices, 0, 0..1);
+
+            // Labels de texto por último — igual o wireframe, sempre visíveis
+            // por cima de tudo (anotação tipo HUD).
+            if !self.text_labels.is_empty() {
+                render_pass.set_pipeline(&self.text_pipeline);
+                render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+                render_pass.set_bind_group(2, &self.font_atlas.bind_group, &[]);
+                for label in self.text_labels.values() {
+                    if !label.visible || label.num_indices == 0 {
+                        continue;
+                    }
+                    render_pass.set_bind_group(1, &label.params_bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, label.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(label.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                    render_pass.draw_indexed(0..label.num_indices, 0, 0..1);
+                }
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

@@ -33,7 +33,8 @@ Fases 1–4 concluídas. O crate `nebula/` expõe uma classe `Renderer` com esta
 | `add_slice(slice_id, volume_id, axis, index)` / `remove_slice(id)` / `set_slice_visible(id, bool)` / `set_slice_axis_index(id, axis, index)` | fatias (`AxisAlignedImage`) posicionadas de verdade no espaço 3D do cubo; várias por volume, todas simultâneas |
 | `nudge_slice(id, screen_dx, screen_dy) -> index` | move uma fatia arrastando o mouse, projetando o eixo de movimento real na tela |
 | `pick_slice(screen_x, screen_y) -> Optional[id]` | descobre qual fatia está embaixo do cursor (ray-cast) |
-| `project_to_screen(x, y, z) -> Optional[(sx, sy)]` | mundo → tela, pra overlays Qt (labels, colorbar) |
+| `project_to_screen(x, y, z) -> Optional[(sx, sy)]` | mundo → tela, pra overlays Qt que não sejam texto |
+| `add_text_label(id, x, y, z, text, r, g, b, scale)` / `remove_text_label(id)` / `set_text_label_visible(id, bool)` / `set_text_label_position(id, x, y, z)` | texto GPU nativo (billboard, fonte bitmap embutida) — sem Qt, sem overlay |
 | `render()` | desenha um frame |
 
 Convenção espacial fixa (cubo unitário -1..1, usada por `add_slice`/picking/labels): mundo
@@ -279,8 +280,9 @@ fatia que já está inteira na GPU — o que também acelera o 3D (mesma estrutu
       contínua não muda (`discrete=False`, já era o padrão da Fase 3.7).
 - [x] Colorbar funcional (`ColorbarWidget`, `python/embed_test.py`): gradiente + ticks
       min/meio/max pintados em `QPainter` puro a partir do mesmo LUT `(N,4)` já usado pelo
-      Nebula — deliberadamente fora do wgpu (texto em GPU pediria um sistema de fonte/atlas
-      novo; mesma razão pela qual o label da cabeça do poço, na Fase 5, também vai ficar em Qt).
+      Nebula — fica **ao lado** do canvas no layout, não por cima, então não é um problema de
+      overlay; não foi revisitado depois que o texto nativo (mais abaixo, "Terceira correção")
+      existiu, mas dá pra portar se um dia fizer sentido ter tudo no mesmo lugar.
 - [x] `Slice2DDialog` (`python/embed_test.py`): diálogo 2D de verdade — segunda `NebulaWindow`
       em modo `"panzoom"`, combobox de eixo, slider de posição, colorbar ao lado. Como cada
       `Renderer` tem seu próprio `wgpu::Device`, o diálogo 2D sobe o mesmo array numpy que já
@@ -383,6 +385,45 @@ definitiva do pick de fatia por hover — as duas pendências que ficaram após 
       o `index` de verdade (0.5 → 0.44) via `nudge_slice`. Pipeline completo (pick → nudge)
       funcionando ponta a ponta.
 
+**Terceira correção — texto virou nativo, não é mais overlay Qt**: o `EdgeLabelsOverlay`
+descrito acima (janela-`Tool` separada) funcionava, mas o usuário foi claro: o Nebula precisa
+ser um motor gráfico **completo**, com texto de verdade renderizado por ele mesmo — "nem que
+tenha que haver um atlas de fontes". Substituído por:
+
+- [x] **Fonte bitmap 5x7 embutida** (`font.rs`), sem nenhuma dependência externa (nada de
+      `freetype`/`ab_glyph`/`glyphon`) — desenhada como arte ASCII no próprio código-fonte
+      (mais fácil de revisar visualmente que bit patterns numéricos), cobrindo A-Z, 0-9 e
+      pontuação básica (espaço, `-`, `.`, `:`, `/`, `_`). Rasterizada uma vez em `Renderer::new()`
+      num atlas `R8Unorm` (upscale 3x + sampler `Linear` pra suavizar os blocos).
+- [x] **Billboard de texto** (`text.rs`/`text.wgsl`): cada label é uma malha de quads (um por
+      caractere, gerada uma vez a partir da string) que sempre encara a câmera — os eixos
+      "direita"/"cima" da câmera (`OrbitCamera::basis`/`PanZoomCamera::basis`, novos campos
+      `camera_right`/`camera_up` no `SceneUniform`) entram no vertex shader pra rotacionar cada
+      quad na direção da tela, não do objeto. Suporta `\n` (texto em várias linhas). Sempre
+      visível por cima de tudo (`depth_compare: Always`, sem escrever profundidade) — mesmo
+      espírito HUD do wireframe antes dele ter sido corrigido pra respeitar profundidade, só que
+      aqui é intencional (anotação, não geometria espacial).
+- [x] `add_text_label(id, x, y, z, text, r, g, b, scale)` / `remove_text_label` /
+      `set_text_label_visible` / `set_text_label_position` — API igual em espírito a
+      `add_slice`: o Python decide *o quê* mostrar (o Nebula não sabe o que é um "IL" ou um
+      survey), o Rust desenha.
+- [x] **`EdgeLabelsOverlay` removida inteiramente** do lado Python — nem janela-`Tool`, nem
+      `WA_AlwaysStackOnTop`, nem reposicionamento a cada frame. Os 5 labels de canto agora são
+      só 5 chamadas de `add_text_label` (uma vez, não a cada frame) em
+      `add_wireframe_edge_labels` (`embed_test.py`) — o texto acompanha orbit/pan/zoom sozinho
+      porque é geometria real da cena, não overlay 2D recalculado.
+
+**Quarta correção — opacidade não escondia mais nada atrás dela, exceto quando não devia
+esconder nada**: com `opacity=0`, a fatia devia ficar 100% invisível — inclusive pro depth
+buffer, senão o wireframe atrás dela continuava sendo ocluído por uma fatia que não desenha cor
+nenhuma. Causa: `depth_write_enabled: true` do `slice_pipeline` escreve profundidade
+incondicionalmente, mesmo quando o alpha de saída é zero. Corrigido com um `discard` no início do
+`fs_main` (`volume_slice.wgsl`) quando `clim.z <= 0.001` — `discard` no WGSL pula o fragmento
+inteiro (cor **e** profundidade), então uma fatia totalmente transparente para de existir pro
+depth test, não só visualmente. Opacidades intermediárias (ex: 50%) continuam escrevendo
+profundidade normalmente — é a limitação normal de alpha blending simples sem ordenação de
+transparência, fora de escopo por enquanto.
+
 ## Fase 5 — Objetos sísmicos específicos (planejada)
 
 Baseada na leitura direta do código atual do Andromeda (`visualization_managers/well/*.py`,
@@ -428,9 +469,8 @@ arrays `(x, y, z)` prontos.
   trocar clim vira `set_mesh_clim(id, ...)`, tão barato quanto `set_volume_clim`.
 - `remove_well(id)` / `set_well_visible(id, bool)`.
 - **Cabeça do poço**: malha pequena (anel + cruz, igual `generate_well_heads_visuals` já faz)
-  em vez de linhas soltas do VisPy. O **label de texto** (nome do poço, coordenadas) fica em Qt
-  — mesma técnica já validada e sem crash do `EdgeLabelsOverlay` da Fase 4 (`project_to_screen`
-  + `QLabel` numa janela-`Tool` sempre no topo), não um sistema de fonte/atlas novo em wgpu.
+  em vez de linhas soltas do VisPy. O **label de texto** (nome do poço, coordenadas) usa
+  `add_text_label` (texto GPU nativo, Fase 4) — não precisa de nenhuma peça nova, já existe.
 
 ### Horizon
 
@@ -514,9 +554,9 @@ Itens já resolvidos marcados com a fase que fechou eles; o resto é a Fase 5/6 
 - **Linhas arbitrárias**: seções extraídas por interpolação ao longo de uma polilinha
   não-axis-aligned através de um volume (2D e 3D). Ainda não planejado em detalhe — depende do
   formato que o pipeline de linha da Fase 5 (horizonte/poço em 2D) assentar.
-- ~~**Wireframe/grid box**~~ — **feito (Fase 4)**: caixa 3D com labels IL/XL/Time nos cantos
-  (`EdgeLabelsOverlay`). Só os 5 cantos principais, não ticks intermediários ao longo das
-  arestas — suficiente por enquanto.
+- ~~**Wireframe/grid box**~~ — **feito (Fase 4)**: caixa 3D com labels IL/XL/Time nos cantos,
+  texto GPU nativo (`add_text_label`, fonte bitmap embutida). Só os 5 cantos principais, não
+  ticks intermediários ao longo das arestas — suficiente por enquanto.
 
 ### Overlays HUD (tela fixa, não fazem parte da geometria 3D do mundo)
 - Bússola de norte e indicador de eixo XYZ, sincronizados manualmente com a rotação da câmera —

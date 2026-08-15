@@ -8,6 +8,10 @@ struct SceneUniform {
     // A visão 2D (câmera PanZoom) é leitura de dado, não superfície lit —
     // aplicar sombreamento nela escureceria a seção sem motivo nenhum.
     flags: vec4<f32>,
+    // Eixos da câmera em coordenadas de mundo (usados pro billboard de
+    // texto) — não usados aqui, mas fazem parte do mesmo buffer físico.
+    camera_right: vec4<f32>,
+    camera_up: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -82,6 +86,17 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    // Opacidade em (ou perto de) zero: descarta o fragmento inteiro em vez de
+    // escrever uma cor invisível. Sem isso, o `depth_write_enabled: true` do
+    // pipeline grava a profundidade da fatia mesmo quando ela não contribui
+    // com cor nenhuma — e como o wireframe (desenhado depois, sem escrever
+    // profundidade) só respeita o que já foi desenhado, a caixa continuava
+    // "escondida" atrás de uma fatia 100% transparente. `discard` evita o
+    // fragmento inteiro (cor E profundidade), então nada fica bloqueado.
+    if (clim.z <= 0.001) {
+        discard;
+    }
+
     // O volume é amostrado na ordem (inline, xline, amostra). Fixamos o eixo
     // escolhido na posição `slice.index` e varremos os outros dois com o uv
     // do quad — é assim que uma seção Inline/Crossline/Time é definida.
