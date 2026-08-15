@@ -303,8 +303,7 @@ wireframe ao redor — exatamente como Petrel/Ocean mostram. Corrigido:
 
 **Fora de escopo desta fase** (fica pra Fase 5, dependem dos dados de horizonte/poço existirem
 primeiro): ray marching/transfer functions pro volume 3D cheio (fácies/corpo geológico),
-horizonte como linha sobreposta na seção 2D, traço do poço sobreposto na seção 2D, ticks/labels
-numéricos (IL/XL/Time) ao redor do wireframe — por enquanto só a caixa, sem texto.
+horizonte como linha sobreposta na seção 2D, traço do poço sobreposto na seção 2D.
 
 **Segunda correção (mesma sessão de teste visual)**: duas coisas mais erradas encontradas
 depois de ver o cubo de verdade renderizando:
@@ -326,6 +325,40 @@ depois de ver o cubo de verdade renderizando:
       dos limites do quad. `NebulaWindow.mousePressEvent` faz o pick assim que Ctrl é
       pressionado; a combobox+"Mover" continuam sendo o fluxo explícito (estilo Andromeda) que
       não depende de picking.
+
+**Fechamento da fase**: ticks numéricos (IL/XL/Time) nos cantos do wireframe e verificação
+definitiva do pick de fatia por hover — as duas pendências que ficaram após a correção do cubo.
+
+- [x] `Renderer::project_to_screen(x, y, z) -> Option<(f32, f32)>` (`lib.rs`): projeta um ponto
+      do cubo (-1..1) pra coordenada de tela sob a câmera atual — mesma ideia do `pick_slice`, só
+      que na direção contrária (mundo → tela em vez de tela → mundo). Serve pros labels de eixo
+      agora e pro nome da cabeça do poço na Fase 5, sem o Nebula precisar saber renderizar texto.
+- [x] `EdgeLabelsOverlay` (`python/embed_test.py`): 5 `QLabel`s nos cantos do wireframe
+      ("IL 0/XL 0/T 0", "IL max/XL 0", etc., igual o Petrel numera a caixa), reposicionados a
+      cada frame via `project_to_screen`. **Achado importante**: `createWindowContainer` embute
+      uma janela nativa de verdade, e widgets Qt comuns *filhos* do container não compõem por
+      cima dela — settar `Qt.WA_AlwaysStackOnTop` "resolvia" visualmente mas **derrubava o
+      processo** (provável conflito com a `wgpu::Surface` criada a partir do HWND cru). A solução
+      que funcionou e não crasha: uma janela-`Tool` **separada** (`Qt.FramelessWindowHint |
+      Qt.WindowStaysOnTopHint`, sem foco, `WA_TransparentForMouseEvents` pra não atrapalhar o
+      orbit/pan/zoom por baixo), reposicionada manualmente pra cobrir a área do canvas a cada
+      frame — técnica padrão do Qt pra overlay sobre widgets nativos/OpenGL.
+- [x] **Achado de ferramental**: `PrintWindow` (usado nas capturas de tela deste projeto) só
+      captura o conteúdo de um HWND específico — não vê outras janelas de nível superior
+      compostas por cima dela pelo Windows (é exatamente o caso da janela-`Tool` acima). As
+      capturas via `PrintWindow` mostravam o cubo sem os labels mesmo com eles renderizando
+      corretamente; só uma captura de tela de verdade (`Graphics.CopyFromScreen`) confirmou que
+      funcionava. Vale lembrar disso da próxima vez que uma feature parecer "invisível" numa
+      captura mas não crashar nem logar erro.
+- [x] **Verificação do `pick_slice`** (não deu pra confirmar com automação de mouse via Win32
+      `mouse_event`/`keybd_event` — o modificador Ctrl não chegava confiável no `mousePressEvent`
+      do Qt): confirmado construindo um `QMouseEvent` com `Qt.ControlModifier` diretamente e
+      chamando os handlers da `NebulaWindow`, sem depender de automação de SO nenhuma — mesmo
+      caminho de código que um usuário real dispara. Resultado: clique no centro pega a fatia
+      Crossline (a que está de frente por padrão); depois de orbitar, o mesmo clique no centro
+      pega a fatia Inline (a que passou a ficar na frente); um Ctrl+arrastar na fatia pega mudou
+      o `index` de verdade (0.5 → 0.44) via `nudge_slice`. Pipeline completo (pick → nudge)
+      funcionando ponta a ponta.
 
 ## Fases seguintes
 

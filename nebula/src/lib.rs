@@ -844,6 +844,26 @@ impl Renderer {
         best.map(|(id, _)| id)
     }
 
+    /// Projeta um ponto do mundo (`x,y,z`, mesma convenção do cubo -1..1 do
+    /// wireframe) pra coordenada de tela em pixels (origem no canto superior
+    /// esquerdo, igual `QPoint`) sob a câmera atual. Usado pro lado Python
+    /// posicionar overlays 2D (labels de eixo, e mais tarde o nome/rótulo da
+    /// cabeça de poço na Fase 5) sem o Nebula precisar saber renderizar
+    /// texto. Devolve `None` se o ponto está atrás da câmera.
+    fn project_to_screen(&self, x: f32, y: f32, z: f32) -> Option<(f32, f32)> {
+        let clip = self.camera.view_proj() * Vec4::new(x, y, z, 1.0);
+        if clip.w <= 1e-4 {
+            return None;
+        }
+        let ndc_x = clip.x / clip.w;
+        let ndc_y = clip.y / clip.w;
+        let width = self.config.width as f32;
+        let height = self.config.height as f32;
+        let screen_x = (ndc_x * 0.5 + 0.5) * width;
+        let screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * height;
+        Some((screen_x, screen_y))
+    }
+
     fn render(&mut self) -> PyResult<()> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
