@@ -139,6 +139,31 @@ deveria ser interpolada silenciosamente entre vizinhos de qualquer forma.
 trabalho do lado Python/Andromeda), múltiplas fatias ortogonais simultâneas, ray marching e
 streaming/paginação de volumes grandes.
 
+## Fase 3.5 — Iluminação dinâmica (concluída)
+
+Decidida antes da Fase 4: iluminação de rasterização clássica (nada de ray tracing — pesado
+demais pro objetivo aqui, que é clareza dos dados, não fotorrealismo, e `wgpu` ainda tem
+suporte a ray tracing só experimental).
+
+- [x] `SliceVertex` ganhou `normal: [f32; 3]` (constante `(0,0,1)` pro quad plano — superfícies
+      curvas da Fase 5 vão precisar de normais de verdade por vértice)
+- [x] Luz pontual **fixa no mundo** (não presa à câmera nem ao objeto): `light_position` fixo
+      em `Renderer`, `Vec3::new(4.0, 5.0, 3.0)`
+- [x] Rotação real do objeto: `model` matrix separada da `view_proj` da câmera, girando
+      sozinha (`Mat4::from_rotation_y`, `MODEL_ROTATION_SPEED` rad/s) — sem isso, a difusa
+      não teria motivo pra mudar, já que ela só depende do ângulo normal↔luz, não de onde a
+      câmera está olhando (diferente do especular, que reage à órbita da câmera)
+- [x] `SceneUniform` (`nebula/src/lib.rs`): um bind group só (`@group(0)`) juntando
+      `view_proj` + `model` + `light_position` + `camera_position` — evita um terceiro bind
+      group pra "mais um uniform de câmera"
+- [x] Shading no `volume_slice.wgsl`: `albedo * (ambient + diffuse) + especular`
+      (Lambertian + Blinn-Phong), `albedo` continua sendo o valor amostrado do volume
+
+**Critério de saída**: confirmado visualmente — capturas em momentos diferentes mostram o quad
+girando sozinho (forma/perspectiva mudando por conta da `model` matrix, não da câmera) e o
+gradiente de sombreamento se deslocando junto, provando que a difusa é recalculada por frame,
+não é uma cor "assada".
+
 ## Fases seguintes
 
 4. **Volume rendering**: ray marching no fragment/compute shader, transfer functions,
