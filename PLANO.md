@@ -19,6 +19,29 @@ shaders nativos — coisa que VisPy (OpenGL genérico via Python) não oferece.
 | `cxx-qt` | **Descartado** | Gera bindings Rust ↔ **C++**. O host real é **Python/PyQt5**, não C++/Qt — `cxx-qt` não se aplica aqui |
 | **PyO3 + `maturin`** | **Escolhido (lado Python)** | Nebula vira um módulo de extensão Python nativo (`import nebula`), packaging via `maturin develop`/`pip install`, API ergonômica pro lado Python |
 
+## Estado atual (resumo — detalhe fase a fase abaixo)
+
+Fases 1–4 concluídas. O crate `nebula/` expõe uma classe `Renderer` com esta API:
+
+| Método | Pra quê |
+|---|---|
+| `Renderer(hwnd, width, height, mode)` | `mode="orbit"` (3D, com luz) ou `"panzoom"` (2D, sem luz) |
+| `resize(w, h)` | reconfigura a `Surface` e o aspect da câmera |
+| `orbit(dx, dy)` / `pan(dx, dy)` / `zoom(delta)` | controle de câmera (orbit só afeta o modo `"orbit"`) |
+| `add_volume(id, w, h, d, data)` / `remove_volume(id)` | textura 3D por id, ordem (inline, xline, amostra) |
+| `set_volume_colormap(id, rgba, discrete)` / `set_volume_clim(id, min, max)` / `set_volume_opacity(id, opacity)` | LUT contínua ou discreta (fácies), faixa de valores, opacidade (padrão 1.0) |
+| `add_slice(slice_id, volume_id, axis, index)` / `remove_slice(id)` / `set_slice_visible(id, bool)` / `set_slice_axis_index(id, axis, index)` | fatias (`AxisAlignedImage`) posicionadas de verdade no espaço 3D do cubo; várias por volume, todas simultâneas |
+| `nudge_slice(id, screen_dx, screen_dy) -> index` | move uma fatia arrastando o mouse, projetando o eixo de movimento real na tela |
+| `pick_slice(screen_x, screen_y) -> Optional[id]` | descobre qual fatia está embaixo do cursor (ray-cast) |
+| `project_to_screen(x, y, z) -> Optional[(sx, sy)]` | mundo → tela, pra overlays Qt (labels, colorbar) |
+| `render()` | desenha um frame |
+
+Convenção espacial fixa (cubo unitário -1..1, usada por `add_slice`/picking/labels): mundo
+**X = Inline, Y = Time (topo = raso), Z = Crossline**.
+
+Ver [`PYTHON_IMPLEMENTATION.md`](PYTHON_IMPLEMENTATION.md) pra como integrar isso no Andromeda de
+verdade (o `python/embed_test.py` é só o protótipo de validação, não código pra copiar direto).
+
 ### Por que não `cxx-qt`
 
 O plano original assumia um host em C++/Qt. Mas a aplicação host real é o **Andromeda**, que é
@@ -66,7 +89,7 @@ Mecanismo:
    de pintura do Qt. Um `QTimer` (ou callback de eventos) do lado Python dispara
    `renderer.render()` periodicamente.
 
-## Fase 1 — Protótipo de encaixe (foco atual)
+## Fase 1 — Protótipo de encaixe (concluída)
 
 - [x] Migrar o triângulo standalone de `glutin`/`gl` para `wgpu` (janela própria via `winit`,
       valida só o pipeline gráfico, sem Qt) — mantido como `triangle_standalone/`, útil como
@@ -223,7 +246,7 @@ aparece retangular (sem distorção de perspectiva), de frente, mostrando camada
 coloridas (bandas roxo/amarelo sobre fundo verde-água) com mergulho e dobra visíveis, iluminação
 (Fase 3.5) ainda aplicada corretamente por cima da cor.
 
-## Fase 4 — Multi-volume, slicing por eixo, visão 2D e fácies (em andamento)
+## Fase 4 — Multi-volume, slicing por eixo, visão 2D e fácies (concluída)
 
 Decidido antes de começar: a visão 2D (equivalente ao `Slice2DDialog` do Andromeda) não é um
 sistema separado — é a **mesma** fatia (`SeismicSlice`), só vista por uma câmera diferente
@@ -360,36 +383,147 @@ definitiva do pick de fatia por hover — as duas pendências que ficaram após 
       o `index` de verdade (0.5 → 0.44) via `nudge_slice`. Pipeline completo (pick → nudge)
       funcionando ponta a ponta.
 
-## Fases seguintes
+## Fase 5 — Objetos sísmicos específicos (planejada)
 
-5. **Objetos sísmicos específicos** (ver seção "Cobertura funcional" abaixo): horizontes,
-   poços/logs, linhas arbitrárias, overlays HUD; horizonte/poço sobrepostos na seção 2D
-6. **Performance**: LOD, streaming de volumes grandes, profiling
+Baseada na leitura direta do código atual do Andromeda (`visualization_managers/well/*.py`,
+`visualization_managers/horizon/horizon_manager.py`) — ver "Cobertura funcional" abaixo pro
+levantamento original. Decisão de fundo, reafirmada pelo usuário: **genericidade não é
+necessária** — nada de sistema genérico de "scene objects"/ECS, só os tipos concretos que o
+Andromeda realmente tem (fatia, poço, horizonte), cada um com seus próprios métodos, igual o
+padrão que já existe (`add_volume`/`add_slice`).
+
+### Peça compartilhada nova: `mesh.rs`
+
+Poço (trajetória, log) e horizonte (picks, grid) são todos **malhas com um escalar por
+vértice** (profundidade, valor de log, amplitude) colorido por colormap — exatamente o problema
+que o `@group(2)` (textura 1D + sampler + `clim`) da Fase 3.7/4 já resolve. Diferença chave em
+relação ao Vispy/`cigvis` de hoje: lá a cor é **assada** em CPU via matplotlib
+(`create_well_logs`, `add_horizon_surface_to_canvas`), então trocar colormap/clim exige
+retesselar a malha inteira (`replot_well_log`). Aqui a cor é sampleada **no shader**, então
+trocar clim/colormap de um poço ou horizonte vira só reescrever um uniform — melhoria real sobre
+o VisPy atual, de graça, porque a arquitetura já foi construída certa desde a Fase 3.7.
+
+- `MeshVertex { position: [f32;3], normal: [f32;3], scalar: f32 }` — normal calculada em Rust
+  (média ponderada por área das faces adjacentes), já que nem `cigvis.trajectory_mesh` nem a
+  triangulação Delaunay do Python devolvem normal pronta.
+  Reaproveita `@group(0)` (câmera/luz, sem mudança) e o mesmo layout de `@group(2)`
+  (colormap+clim) do volume. **Sem** `@group(1)` (textura de volume) nem `@group(3)` (slice
+  params) — não fazem sentido pra malha.
+- Upload genérico: `MeshEntry { vertex_buffer, index_buffer, num_indices, colormap, clim,
+  visible }`, guardado num `HashMap<id, MeshEntry>` por tipo (mesmo padrão de
+  `volumes`/`slices` da Fase 4).
+
+### Well
+
+Python continua 100% responsável pelo domínio (checkshot, transformação survey→índice de grid,
+flip de profundidade — tudo que `Well3DPositionGenerator.run()` já faz hoje); o Nebula só recebe
+arrays `(x, y, z)` prontos.
+
+- `add_well_trajectory(id, vertices, indices, color)` — a tesselação do tubo continua vindo do
+  Python via `cigvis.meshs.well_logs.trajectory_mesh` (é só geometria de varredura de círculo ao
+  longo de uma polilinha; reimplementar em Rust não compensa — poços são minúsculos perto de um
+  volume). O Rust só sobe `verts`/`faces`, igual `add_volume` já faz com o array de voxels.
+- `add_well_log(id, vertices, indices, scalar_per_vertex, clim)` — mesmo tubo, mas cor vem do
+  colormap em shader agora, não mais assada no Python. `replot_well_log` deixa de existir:
+  trocar clim vira `set_mesh_clim(id, ...)`, tão barato quanto `set_volume_clim`.
+- `remove_well(id)` / `set_well_visible(id, bool)`.
+- **Cabeça do poço**: malha pequena (anel + cruz, igual `generate_well_heads_visuals` já faz)
+  em vez de linhas soltas do VisPy. O **label de texto** (nome do poço, coordenadas) fica em Qt
+  — mesma técnica já validada e sem crash do `EdgeLabelsOverlay` da Fase 4 (`project_to_screen`
+  + `QLabel` numa janela-`Tool` sempre no topo), não um sistema de fonte/atlas novo em wgpu.
+
+### Horizon
+
+O usuário sinalizou que pretende **redesenhar** o horizonte do zero (hoje é só picks
+triangulados + grid), com atributos (principalmente decomposição espectral — 3 horizontes de
+frequências diferentes sobrepostos) e picking interativo. A API abaixo já nasce preparada pra
+isso sem exigir retrabalho:
+
+- `add_horizon_picks(id, vertices, triangle_indices, scalar_per_vertex, clim)` — a triangulação
+  Delaunay continua no Python (`scipy.spatial.Delaunay`, é álgebra 2D, não é trabalho de
+  renderer).
+- `add_horizon_grid(id, n1, n2, z_values)` — aqui vale tesselar **no Rust**: malha de grid
+  estruturado é trivial (lattice regular, não precisa de Delaunay), evita ida e volta de dados
+  que o Python já não precisaria processar.
+- **Ponto de extensão pra decomposição espectral**: em vez de um `scalar: f32` único por
+  vértice, a struct interna guarda `attributes: HashMap<String, Vec<f32>>` (Z, amplitude, banda
+  de frequência 1/2/3...) + `set_active_attribute(id, name)` escolhendo qual alimenta o
+  colormap agora. **Não** implementar o blend de 3 bandas sobrepostas nesta fase — só deixar o
+  layout pronto pra não exigir reescrever tudo quando o redesenho for fechado.
+- `remove_horizon(id)` / `set_horizon_visible(id, bool)`.
+
+### Horizonte/poço sobrepostos na seção 2D (adiado da Fase 4)
+
+Pipeline novo e pequeno, `line.wgsl`: vértices só posição+cor, sem luz, `LineList`, reaproveita
+só `@group(0)`. Dados: perfil de Z do horizonte ao longo da linha de inline/crossline atual vira
+uma polyline 2D; o traço do poço na seção vira uma linha vertical na posição onde ele cruza —
+os dois calculados em Python a partir de dados que já existem, sem peça nova de domínio.
+
+### Picking generalizado
+
+`pick_slice` (Fase 4) só testa fatias. Generalizar pra `pick(screen_x, screen_y) ->
+Optional[(kind, id)]` testando fatias **e** malhas (poço, horizonte) é o que picking de
+horizonte (criar um pick clicando na cena) vai precisar. **Nota de processo**: a forma confiável
+de testar interação com modificador (Ctrl+clique) é construir um `QMouseEvent` diretamente e
+chamar os handlers — a automação de mouse via Win32 (`mouse_event`/`keybd_event`) não entrega o
+modificador Ctrl de forma confiável ao Qt (achado da Fase 4, ver acima).
+
+### Fora de escopo da Fase 5 (decisões já tomadas, não revisitar sem motivo novo)
+
+- LUT categórica de poço/log — fica no LogPlot Vision (VisPy), Nebula não trata disso.
+- Blend de decomposição espectral (3 horizontes sobrepostos) — só a infraestrutura de múltiplos
+  atributos fica pronta, o blend em si é trabalho futuro quando o redesenho do horizonte fechar.
+- Criar picks de horizonte de fato (fluxo de edição) — só a infraestrutura de picking genérico.
+
+## Fase 6 — Performance (planejada)
+
+- **Streaming/paginação de volumes grandes**: dados sísmicos reais são GBs — carregar tudo de
+  uma vez em `add_volume` não escala. Precisa de leitura lazy por chunk a partir do HDF5 (Python
+  continua responsável pela paginação; o Rust recebe chunks e faz upload incremental na textura
+  3D via `write_texture` com `Origin3d` diferente de zero, em vez de recriar a textura inteira).
+- **LOD por distância de câmera**: mipmaps da textura de volume, ou downsample dinâmico da
+  resolução amostrada, pra volumes que hoje forçariam recriar a textura inteira a cada zoom.
+- **Ray marching / transfer functions** pro volume 3D cheio (fácies, corpo geológico) — adiado
+  da Fase 4 porque não bloqueia poço/horizonte. Pipeline separado (`ray_march.wgsl`), desenha um
+  cubo-proxy em vez do quad da fatia, acumula cor+opacidade front-to-back amostrando o volume ao
+  longo do raio; reaproveita `@group(1)` (volume) e `@group(2)` (colormap) — só precisa que o
+  canal alpha do colormap (hoje sempre opaco) vire a curva de opacidade da transfer function.
+- **Profiling com dado real**: o volume sintético de 128³ usado nos testes (Fase 4) não estressa
+  nada — sobra FPS (4000+). Só vale investir em otimização depois de testar com um volume de
+  survey de verdade (centenas de MB a poucos GB).
+- Reavaliar compute shaders (`wgpu`) vs. fragment shader puro pro ray marching quando houver
+  esse volume real pra medir contra.
 
 ## Cobertura funcional — o que o Nebula precisa equivaler/superar em relação ao VisPy atual
 
 Levantado a partir do código real do Andromeda
 (`src/core/visualization/seismic/`). Serve de checklist de paridade funcional pras Fases 3–6.
+Itens já resolvidos marcados com a fase que fechou eles; o resto é a Fase 5/6 acima.
 
 ### Objetos de cena
-- **Slices axis-aligned de volumes** (`AxisAlignedImage`): planos 2D dentro de um volume 3D,
-  dados vindos de HDF5 (lazy, sem carregar tudo em memória). Precisa suportar múltiplos volumes
-  simultâneos (sísmica, facies com LUT categórica, atributos elásticos multi-canal) alinhados
-  num grid compartilhado via offset + escala por volume (ver "Sistema de coordenadas" abaixo).
+- ~~**Slices axis-aligned de volumes** (`AxisAlignedImage`)~~ — **feito (Fase 4)**: múltiplos
+  volumes simultâneos, cada um com várias fatias, posicionadas de verdade no espaço 3D. Falta
+  ainda: leitura lazy de HDF5 (streaming, Fase 6) e alinhamento por offset/escala de survey real
+  (Fase 5/6, quando integrar com dados reais do Andromeda — o cubo hoje é sempre -1..1 unitário).
 - **Horizontes**: duas representações — picks (mesh via triangulação Delaunay da projeção XY)
-  e superfície gridada interpolada. Hoje geradas via biblioteca externa `cigvis`; o Nebula
-  precisa reimplementar essa geração de mesh.
+  e superfície gridada interpolada. Hoje geradas via biblioteca externa `cigvis`; plano de
+  substituição na Fase 5 acima.
 - **Poços**: trajetória (tubo/mesh ao longo da trajetória 3D) + logs coloridos por colormap ao
-  longo do tubo. Também depende de `cigvis` hoje (`create_well_logs`, `trajectory_mesh`).
+  longo do tubo. Também depende de `cigvis` hoje (`create_well_logs`, `trajectory_mesh`); plano
+  de substituição na Fase 5 acima.
 - **Linhas arbitrárias**: seções extraídas por interpolação ao longo de uma polilinha
-  não-axis-aligned através de um volume (2D e 3D).
-- **Wireframe/grid box**: caixa 3D com ticks e labels nos 3 eixos (Inline/Crossline/Time).
+  não-axis-aligned através de um volume (2D e 3D). Ainda não planejado em detalhe — depende do
+  formato que o pipeline de linha da Fase 5 (horizonte/poço em 2D) assentar.
+- ~~**Wireframe/grid box**~~ — **feito (Fase 4)**: caixa 3D com labels IL/XL/Time nos cantos
+  (`EdgeLabelsOverlay`). Só os 5 cantos principais, não ticks intermediários ao longo das
+  arestas — suficiente por enquanto.
 
 ### Overlays HUD (tela fixa, não fazem parte da geometria 3D do mundo)
-- Bússola de norte e indicador de eixo XYZ, sincronizados manualmente com a rotação da câmera.
-- Colorbar — hoje renderizada via matplotlib → raster estático (caro, replota a figura inteira
-  a cada mudança de cmap/clim). No Nebula isso deve virar uma textura 1D de LUT + shader, não
-  um raster gerado externamente.
+- Bússola de norte e indicador de eixo XYZ, sincronizados manualmente com a rotação da câmera —
+  ainda não implementado.
+- ~~Colorbar~~ — **feito (Fase 4)**: `ColorbarWidget` em Qt puro (`QPainter`), gradiente do
+  mesmo LUT `(N,4)` já usado pelo Nebula, sem replotar nada a cada mudança de cmap/clim (ao
+  contrário do raster matplotlib do VisPy atual).
 
 ### Sistema de coordenadas (precisa ser portado fielmente)
 - Array de volume: shape `(n_inline, n_xline, n_samples)`.
@@ -404,9 +538,11 @@ Levantado a partir do código real do Andromeda
 
 ## Notas
 
-- Dados sísmicos reais são tipicamente grandes (GBs) — desde a Fase 3 já pensar em
-  streaming/paginação, não carregar o volume inteiro em memória de uma vez.
-- Reavaliar o uso de compute shaders (wgpu) vs. fragment shader puro para o ray marching
-  assim que houver volume real de teste.
-- `cigvis` é usado hoje pra geração de mesh de superfícies, tubos de poço/log e linhas
-  arbitrárias — é a maior peça de lógica geométrica a reimplementar em Rust.
+- `cigvis` continua sendo usado do lado Python na Fase 5 (tesselação de tubo de poço via
+  `trajectory_mesh`) — não é reimplementado em Rust, só o upload da malha resultante. A
+  triangulação Delaunay de horizonte (`scipy.spatial.Delaunay`) segue a mesma lógica: é álgebra
+  2D do lado Python, não trabalho de renderer.
+- Ver [`PYTHON_IMPLEMENTATION.md`](PYTHON_IMPLEMENTATION.md) pro guia prático de como integrar
+  o Nebula no Andromeda de verdade — instalação, ciclo de vida do `Renderer`, convenções de
+  dados, e como isso se encaixa nos managers que já existem
+  (`VolumeSlicesManager`/`HorizonManager`/`Well3DPlotManager`).
