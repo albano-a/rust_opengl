@@ -3,10 +3,9 @@ mod geometry;
 mod volume;
 
 use std::num::NonZeroIsize;
-use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::Mat4;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -17,9 +16,6 @@ use geometry::{SliceVertex, SLICE_INDICES, SLICE_VERTICES};
 use volume::Volume3D;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-// Radianos por segundo — só rápido o suficiente pra deixar óbvio que a difusa
-// está reagindo em tempo real, sem ficar irritante de olhar.
-const MODEL_ROTATION_SPEED: f32 = 0.4;
 
 /// Tudo que os shaders precisam saber sobre a cena por frame: câmera (pra
 /// projetar vértices) e luz (pra shading). Um bind group só em vez de dois,
@@ -66,8 +62,6 @@ struct Renderer {
     depth_view: wgpu::TextureView,
 
     camera: OrbitCamera,
-    light_position: Vec3,
-    start_time: Instant,
     scene_buffer: wgpu::Buffer,
     scene_bind_group: wgpu::BindGroup,
 
@@ -147,10 +141,6 @@ impl Renderer {
         let depth_view = create_depth_view(&device, &config);
 
         let camera = OrbitCamera::new(config.width as f32 / config.height as f32);
-        // Fixa no mundo, não presa à câmera nem ao objeto — é isso que faz a
-        // difusa reagir de verdade quando o objeto gira (Fase 3.5).
-        let light_position = Vec3::new(4.0, 5.0, 3.0);
-        let start_time = Instant::now();
 
         let scene_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -167,14 +157,15 @@ impl Renderer {
                 }],
             });
 
+        let initial_eye = camera.eye();
         let initial_scene_uniform = SceneUniform {
             view_proj: camera.view_proj().to_cols_array_2d(),
             model: Mat4::IDENTITY.to_cols_array_2d(),
-            light_position: [light_position.x, light_position.y, light_position.z, 0.0],
-            camera_position: {
-                let eye = camera.eye();
-                [eye.x, eye.y, eye.z, 0.0]
-            },
+            // Luz "headlight": acompanha a câmera em vez de ficar fixa no mundo,
+            // pra o lado da superfície que você está olhando ficar sempre bem
+            // iluminado, não importa de que ângulo — é assim que o Petrel faz.
+            light_position: [initial_eye.x, initial_eye.y, initial_eye.z, 0.0],
+            camera_position: [initial_eye.x, initial_eye.y, initial_eye.z, 0.0],
         };
 
         let scene_buffer = wgpu::util::DeviceExt::create_buffer_init(
@@ -292,8 +283,6 @@ impl Renderer {
             config,
             depth_view,
             camera,
-            light_position,
-            start_time,
             scene_buffer,
             scene_bind_group,
             slice_pipeline,
@@ -379,17 +368,15 @@ impl Renderer {
             }
         };
 
-        // Rotação automática do objeto (independente da câmera) — é o que faz a
-        // parte difusa da iluminação mudar de verdade, já que ela só depende do
-        // ângulo normal↔luz, não de onde a câmera está olhando.
-        let elapsed = self.start_time.elapsed().as_secs_f32();
-        let model = Mat4::from_rotation_y(elapsed * MODEL_ROTATION_SPEED);
+        // Objeto não gira sozinho — só a câmera se move. A luz acompanha a
+        // câmera ("headlight"), então o lado que você está olhando fica sempre
+        // bem iluminado, do jeito que o Petrel faz.
         let eye = self.camera.eye();
 
         let scene_uniform = SceneUniform {
             view_proj: self.camera.view_proj().to_cols_array_2d(),
-            model: model.to_cols_array_2d(),
-            light_position: [self.light_position.x, self.light_position.y, self.light_position.z, 0.0],
+            model: Mat4::IDENTITY.to_cols_array_2d(),
+            light_position: [eye.x, eye.y, eye.z, 0.0],
             camera_position: [eye.x, eye.y, eye.z, 0.0],
         };
 

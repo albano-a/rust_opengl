@@ -49,15 +49,24 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // usuário é trabalho da Fase 4/5 (equivalente ao AxisAlignedImage do VisPy).
     let albedo = textureSample(volume_texture, volume_sampler, vec3<f32>(input.uv, 0.5)).r;
 
-    let normal = normalize(input.world_normal);
-    let light_dir = normalize(scene.light_position.xyz - input.world_position);
+    var normal = normalize(input.world_normal);
     let view_dir = normalize(scene.camera_position.xyz - input.world_position);
-    let half_dir = normalize(light_dir + view_dir);
 
+    // Plano sem espessura: só existe uma normal por vértice, mas as duas faces
+    // podem ficar visíveis (ex: objeto visto por trás). Vira a normal pro lado
+    // de quem está olhando pra não escurecer a face errada.
+    if dot(normal, view_dir) < 0.0 {
+        normal = -normal;
+    }
+
+    let light_dir = normalize(scene.light_position.xyz - input.world_position);
+
+    // Sem especular: com a luz colada na câmera (headlight), o brilho
+    // especular fica sempre grudado bem no centro da tela, parecendo uma
+    // superfície molhada/plástica — errado pra uma fatia sísmica, que é fosca.
     let ambient = 0.15;
     let diffuse = max(dot(normal, light_dir), 0.0);
-    let specular = pow(max(dot(normal, half_dir), 0.0), 32.0) * 0.5;
 
-    let lit = albedo * (ambient + diffuse) + specular;
+    let lit = albedo * (ambient + diffuse);
     return vec4<f32>(lit, lit, lit, 1.0);
 }
