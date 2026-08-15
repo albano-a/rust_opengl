@@ -85,11 +85,28 @@ Mecanismo:
 dentro de uma janela PyQt5 real (via `createWindowContainer`), sem intervenção do pipeline de
 pintura do Qt, chamável como `import nebula`.
 
-## Fases seguintes (não iniciar antes da Fase 1 validada)
+## Fase 2 — Fundamentos wgpu: MVP e câmera orbital (concluída)
 
-2. **Fundamentos wgpu**: uniforms, matrizes MVP, câmera 3D orbital (equivalente ao
-   `MiddlePanTurntableCamera` do VisPy — botão esquerdo=rotate, meio=pan, direito=zoom,
-   com inércia), texturas 2D
+- [x] Uniform buffer + bind group pra matriz `view_proj` (`camera_bind_group`, `@group(0)`)
+- [x] Geometria de teste com profundidade real: cubo indexado (`nebula/src/geometry.rs`),
+      substituindo o triângulo 2D em clip-space da Fase 1
+- [x] Depth buffer (`Depth32Float`) + `DepthStencilState`, recriado a cada resize
+- [x] Câmera orbital (`nebula/src/camera.rs`, `OrbitCamera`) equivalente ao
+      `MiddlePanTurntableCamera` do VisPy: parametrizada por azimute/elevação/distância/alvo
+  - `orbit(dx, dy)` — botão esquerdo
+  - `pan(dx, dy)` — botão do meio
+  - `zoom(delta)` — botão direito / scroll
+- [x] Input plugado do lado Python (`python/embed_test.py`): o Qt já possui o event loop e
+      recebe os eventos de mouse na `QWindow`, então os handlers em Python só encaminham
+      deltas pros métodos do `Renderer` — sem duplicar um sistema de input dentro do Rust
+- [ ] Inércia de rotação (fica pra uma passada de polimento futura, não bloqueia as próximas fases)
+
+**Critério de saída**: cubo colorido por vértice, com profundidade correta, giro/pan/zoom
+controláveis por mouse dentro da janela PyQt5 — validado manualmente (drag esquerdo, meio,
+scroll).
+
+## Fases seguintes
+
 3. **Volumes**: texturas 3D, upload de dados sísmicos a partir de HDF5 (lazy, sem carregar o
    volume inteiro em memória)
 4. **Volume rendering**: ray marching no fragment/compute shader, transfer functions,
