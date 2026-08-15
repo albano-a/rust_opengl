@@ -105,10 +105,31 @@ pintura do Qt, chamável como `import nebula`.
 controláveis por mouse dentro da janela PyQt5 — validado manualmente (drag esquerdo, meio,
 scroll).
 
+## Fase 3 — Textura 3D e upload de volume (concluída)
+
+- [x] `nebula/src/volume.rs`: `Volume3D` — cria a textura 3D (`R32Float`), faz upload via
+      `queue.write_texture` e monta o bind group (textura + sampler)
+- [x] Detecção de suporte a `FLOAT32_FILTERABLE` no adapter, com fallback pra sampling
+      `Nearest` quando a feature não está disponível
+- [x] `Renderer::load_volume(width, height, depth, data)` — recebe o volume do lado Python via
+      `pyo3::buffer::PyBuffer<f32>` (protocolo de buffer do numpy, sem depender da crate
+      `numpy`/rust-numpy — evita mais uma dependência bleeding-edge pra rastrear)
+- [x] Geometria de teste trocada: cubo da Fase 2 saiu, entrou um quad (`SliceVertex`) que
+      amostra a fatia do meio (`w = 0.5`) do volume 3D — usa a mesma câmera/MVP da Fase 2,
+      então dá pra orbitar e confirmar que está posicionado de verdade em 3D
+- [x] Volume sintético de teste em `python/embed_test.py` (`build_synthetic_volume`):
+      gradiente + xadrez 3D gerado com numpy, sem dependência de dados reais ainda
+
+**Critério de saída**: padrão sintético gerado em Python aparece corretamente na fatia
+renderizada. Build e import do módulo verificados; teste visual interativo (abrir a janela e
+orbitar) fica por conta do usuário nesta rodada.
+
+**Fora de escopo desta fase** (fica pras seguintes): leitura de HDF5 real (isso continua sendo
+trabalho do lado Python/Andromeda), múltiplas fatias ortogonais simultâneas, ray marching e
+streaming/paginação de volumes grandes.
+
 ## Fases seguintes
 
-3. **Volumes**: texturas 3D, upload de dados sísmicos a partir de HDF5 (lazy, sem carregar o
-   volume inteiro em memória)
 4. **Volume rendering**: ray marching no fragment/compute shader, transfer functions,
    slicing de planos axis-aligned (equivalente ao `AxisAlignedImage` do VisPy)
 5. **Objetos sísmicos específicos** (ver seção "Cobertura funcional" abaixo): horizontes,
