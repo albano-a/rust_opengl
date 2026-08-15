@@ -34,7 +34,9 @@ impl OrbitCamera {
         }
     }
 
-    fn eye(&self) -> Vec3 {
+    /// Posição da câmera no mundo — usada pelo shader pro termo especular
+    /// (que depende de onde o observador está, ao contrário da difusa).
+    pub fn eye(&self) -> Vec3 {
         let x = self.distance * self.elevation.cos() * self.azimuth.sin();
         let y = self.distance * self.elevation.sin();
         let z = self.distance * self.elevation.cos() * self.azimuth.cos();

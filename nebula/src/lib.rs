@@ -3,7 +3,10 @@ mod geometry;
 mod volume;
 
 use std::num::NonZeroIsize;
+use std::time::Instant;
 
+use bytemuck::{Pod, Zeroable};
+use glam::{Mat4, Vec3};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -14,6 +17,22 @@ use geometry::{SliceVertex, SLICE_INDICES, SLICE_VERTICES};
 use volume::Volume3D;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+// Radianos por segundo — só rápido o suficiente pra deixar óbvio que a difusa
+// está reagindo em tempo real, sem ficar irritante de olhar.
+const MODEL_ROTATION_SPEED: f32 = 0.4;
+
+/// Tudo que os shaders precisam saber sobre a cena por frame: câmera (pra
+/// projetar vértices) e luz (pra shading). Um bind group só em vez de dois,
+/// já que ambos são "globals" recalculados a cada frame.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct SceneUniform {
+    view_proj: [[f32; 4]; 4],
+    model: [[f32; 4]; 4],
+    // xyz usados; w é só padding pra alinhamento de 16 bytes em uniform buffers.
+    light_position: [f32; 4],
+    camera_position: [f32; 4],
+}
 
 fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -47,8 +66,10 @@ struct Renderer {
     depth_view: wgpu::TextureView,
 
     camera: OrbitCamera,
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
+    light_position: Vec3,
+    start_time: Instant,
+    scene_buffer: wgpu::Buffer,
+    scene_bind_group: wgpu::BindGroup,
 
     slice_pipeline: wgpu::RenderPipeline,
     slice_vertex_buffer: wgpu::Buffer,
@@ -126,13 +147,17 @@ impl Renderer {
         let depth_view = create_depth_view(&device, &config);
 
         let camera = OrbitCamera::new(config.width as f32 / config.height as f32);
+        // Fixa no mundo, não presa à câmera nem ao objeto — é isso que faz a
+        // difusa reagir de verdade quando o objeto gira (Fase 3.5).
+        let light_position = Vec3::new(4.0, 5.0, 3.0);
+        let start_time = Instant::now();
 
-        let camera_bind_group_layout =
+        let scene_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("camera_bind_group_layout"),
+                label: Some("scene_bind_group_layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -142,21 +167,31 @@ impl Renderer {
                 }],
             });
 
-        let camera_buffer = wgpu::util::DeviceExt::create_buffer_init(
+        let initial_scene_uniform = SceneUniform {
+            view_proj: camera.view_proj().to_cols_array_2d(),
+            model: Mat4::IDENTITY.to_cols_array_2d(),
+            light_position: [light_position.x, light_position.y, light_position.z, 0.0],
+            camera_position: {
+                let eye = camera.eye();
+                [eye.x, eye.y, eye.z, 0.0]
+            },
+        };
+
+        let scene_buffer = wgpu::util::DeviceExt::create_buffer_init(
             &device,
             &wgpu::util::BufferInitDescriptor {
-                label: Some("camera_buffer"),
-                contents: bytemuck::cast_slice(&[camera.view_proj()]),
+                label: Some("scene_buffer"),
+                contents: bytemuck::cast_slice(&[initial_scene_uniform]),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             },
         );
 
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera_bind_group"),
-            layout: &camera_bind_group_layout,
+        let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene_bind_group"),
+            layout: &scene_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: camera_buffer.as_entire_binding(),
+                resource: scene_buffer.as_entire_binding(),
             }],
         });
 
@@ -196,7 +231,7 @@ impl Renderer {
 
         let slice_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("slice_pipeline_layout"),
-            bind_group_layouts: &[Some(&camera_bind_group_layout), Some(&volume_bind_group_layout)],
+            bind_group_layouts: &[Some(&scene_bind_group_layout), Some(&volume_bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -257,8 +292,10 @@ impl Renderer {
             config,
             depth_view,
             camera,
-            camera_buffer,
-            camera_bind_group,
+            light_position,
+            start_time,
+            scene_buffer,
+            scene_bind_group,
             slice_pipeline,
             slice_vertex_buffer,
             slice_index_buffer,
@@ -342,11 +379,22 @@ impl Renderer {
             }
         };
 
-        self.queue.write_buffer(
-            &self.camera_buffer,
-            0,
-            bytemuck::cast_slice(&[self.camera.view_proj()]),
-        );
+        // Rotação automática do objeto (independente da câmera) — é o que faz a
+        // parte difusa da iluminação mudar de verdade, já que ela só depende do
+        // ângulo normal↔luz, não de onde a câmera está olhando.
+        let elapsed = self.start_time.elapsed().as_secs_f32();
+        let model = Mat4::from_rotation_y(elapsed * MODEL_ROTATION_SPEED);
+        let eye = self.camera.eye();
+
+        let scene_uniform = SceneUniform {
+            view_proj: self.camera.view_proj().to_cols_array_2d(),
+            model: model.to_cols_array_2d(),
+            light_position: [self.light_position.x, self.light_position.y, self.light_position.z, 0.0],
+            camera_position: [eye.x, eye.y, eye.z, 0.0],
+        };
+
+        self.queue
+            .write_buffer(&self.scene_buffer, 0, bytemuck::cast_slice(&[scene_uniform]));
 
         let view = frame
             .texture
@@ -392,7 +440,7 @@ impl Renderer {
             // só limpamos a tela — não há bind group de textura pra desenhar.
             if let Some(volume) = &self.volume {
                 render_pass.set_pipeline(&self.slice_pipeline);
-                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
                 render_pass.set_bind_group(1, &volume.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, self.slice_vertex_buffer.slice(..));
                 render_pass
