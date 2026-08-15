@@ -4,6 +4,10 @@ struct SceneUniform {
     // xyz usados; w é só padding pra alinhamento de 16 bytes em uniform buffers.
     light_position: vec4<f32>,
     camera_position: vec4<f32>,
+    // x = 1.0 se a iluminação (ambiente+difusa) deve ser aplicada, 0.0 se não.
+    // A visão 2D (câmera PanZoom) é leitura de dado, não superfície lit —
+    // aplicar sombreamento nela escureceria a seção sem motivo nenhum.
+    flags: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -20,6 +24,18 @@ var colormap_texture: texture_1d<f32>;
 var colormap_sampler: sampler;
 @group(2) @binding(2)
 var<uniform> clim: vec4<f32>; // x = min, y = max; zw não usados (padding)
+
+// Qual eixo do volume esta fatia mostra e em que posição normalizada (0..1)
+// ao longo dele. axis: 0 = Inline, 1 = Crossline, 2 = Time — mesma convenção
+// do `AXIS_CONFIG` do diálogo 2D do Andromeda.
+struct SliceParams {
+    axis: u32,
+    index: f32,
+    _pad: vec2<f32>,
+};
+
+@group(3) @binding(0)
+var<uniform> slice: SliceParams;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -52,19 +68,30 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    // Fase 3: sempre uma seção vertical fixa na crossline do meio (v = 0.5) —
-    // eixo X do quad = inline, eixo Y do quad = profundidade/tempo. É essa
-    // orientação (não uma fatia horizontal de tempo) que dá a cara clássica de
-    // seção sísmica. Deixar o usuário escolher qual eixo fatiar é Fase 4/5
-    // (equivalente ao AxisAlignedImage do VisPy).
-    let raw_value =
-        textureSample(volume_texture, volume_sampler, vec3<f32>(input.uv.x, 0.5, input.uv.y)).r;
+    // O volume é amostrado na ordem (inline, xline, amostra). Fixamos o eixo
+    // escolhido na posição `slice.index` e varremos os outros dois com o uv
+    // do quad — é assim que uma seção Inline/Crossline/Time é definida.
+    var coord: vec3<f32>;
+    if (slice.axis == 0u) {
+        coord = vec3<f32>(slice.index, input.uv.x, input.uv.y);
+    } else if (slice.axis == 1u) {
+        coord = vec3<f32>(input.uv.x, slice.index, input.uv.y);
+    } else {
+        coord = vec3<f32>(input.uv.x, input.uv.y, slice.index);
+    }
 
-    // Normaliza pelo clim (igual o `clim=(min,max)` do Andromeda) antes de
+    let raw_value = textureSample(volume_texture, volume_sampler, coord).r;
+
+    // Normaliza pelo clim (igual o `clim=(min, max)` do Andromeda) antes de
     // indexar a LUT — os dois extremos do colormap ficam nos limites do dado,
     // não em 0..1 fixo.
     let t = clamp((raw_value - clim.x) / max(clim.y - clim.x, 1e-6), 0.0, 1.0);
     let albedo = textureSample(colormap_texture, colormap_sampler, t).rgb;
+
+    if (scene.flags.x < 0.5) {
+        // Visão 2D: cor crua do colormap, sem sombreamento.
+        return vec4<f32>(albedo, 1.0);
+    }
 
     var normal = normalize(input.world_normal);
     let view_dir = normalize(scene.camera_position.xyz - input.world_position);

@@ -87,3 +87,110 @@ impl OrbitCamera {
         self.aspect = aspect.max(0.01);
     }
 }
+
+/// Câmera 2D (pan + zoom, sem rotação), equivalente ao `PanZoomCamera` do
+/// VisPy usado hoje no diálogo de seção 2D do Andromeda. Olha sempre reto
+/// pro plano XY a partir de +Z, com projeção ortográfica — sem perspectiva,
+/// porque uma seção 2D é leitura de dado, não uma cena espacial.
+pub struct PanZoomCamera {
+    pub target: Vec3,
+    pub zoom: f32,
+    pub aspect: f32,
+}
+
+impl PanZoomCamera {
+    const MIN_ZOOM: f32 = 0.02;
+    const MAX_ZOOM: f32 = 50.0;
+
+    pub fn new(aspect: f32) -> Self {
+        Self { target: Vec3::ZERO, zoom: 1.2, aspect }
+    }
+
+    pub fn eye(&self) -> Vec3 {
+        self.target + Vec3::new(0.0, 0.0, 5.0)
+    }
+
+    #[allow(deprecated)]
+    pub fn view_proj(&self) -> Mat4 {
+        let half_h = self.zoom;
+        let half_w = half_h * self.aspect.max(0.01);
+        let view = Mat4::look_at_rh(self.eye(), self.target, Vec3::Y);
+        let proj = Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, 0.1, 100.0);
+        proj * view
+    }
+
+    /// Arrastar com o botão esquerdo/do meio: translada o alvo no plano.
+    pub fn pan(&mut self, dx: f32, dy: f32) {
+        let sensitivity = 0.002 * self.zoom;
+        self.target += Vec3::new(-dx * sensitivity, dy * sensitivity, 0.0);
+    }
+
+    /// Scroll: aproxima/afasta (reduz/aumenta a área ortográfica visível).
+    pub fn zoom(&mut self, delta: f32) {
+        self.zoom = (self.zoom - delta * 0.01 * self.zoom).clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+    }
+
+    pub fn set_aspect(&mut self, aspect: f32) {
+        self.aspect = aspect.max(0.01);
+    }
+}
+
+/// As duas câmeras que o Nebula suporta hoje: orbital (visão 3D, com luz) e
+/// pan/zoom (visão 2D, sem luz — ver `SceneUniform::flags`). Um `Renderer` usa
+/// uma ou outra pra vida inteira, escolhida na criação.
+pub enum CameraKind {
+    Orbit(OrbitCamera),
+    PanZoom(PanZoomCamera),
+}
+
+impl CameraKind {
+    pub fn view_proj(&self) -> Mat4 {
+        match self {
+            CameraKind::Orbit(c) => c.view_proj(),
+            CameraKind::PanZoom(c) => c.view_proj(),
+        }
+    }
+
+    pub fn eye(&self) -> Vec3 {
+        match self {
+            CameraKind::Orbit(c) => c.eye(),
+            CameraKind::PanZoom(c) => c.eye(),
+        }
+    }
+
+    pub fn set_aspect(&mut self, aspect: f32) {
+        match self {
+            CameraKind::Orbit(c) => c.set_aspect(aspect),
+            CameraKind::PanZoom(c) => c.set_aspect(aspect),
+        }
+    }
+
+    /// Seção 2D é dado plano, não superfície lit — a luz (difusa/ambiente)
+    /// só faz sentido na visão 3D orbital.
+    pub fn lighting_enabled(&self) -> f32 {
+        match self {
+            CameraKind::Orbit(_) => 1.0,
+            CameraKind::PanZoom(_) => 0.0,
+        }
+    }
+
+    pub fn orbit(&mut self, dx: f32, dy: f32) {
+        if let CameraKind::Orbit(c) = self {
+            c.orbit(dx, dy);
+        }
+    }
+
+    pub fn pan(&mut self, dx: f32, dy: f32) {
+        match self {
+            CameraKind::Orbit(c) => c.pan(dx, dy),
+            CameraKind::PanZoom(c) => c.pan(dx, dy),
+        }
+    }
+
+    pub fn zoom(&mut self, delta: f32) {
+        match self {
+            CameraKind::Orbit(c) => c.zoom(delta),
+            CameraKind::PanZoom(c) => c.zoom(delta),
+        }
+    }
+}

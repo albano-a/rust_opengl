@@ -223,12 +223,59 @@ aparece retangular (sem distorção de perspectiva), de frente, mostrando camada
 coloridas (bandas roxo/amarelo sobre fundo verde-água) com mergulho e dobra visíveis, iluminação
 (Fase 3.5) ainda aplicada corretamente por cima da cor.
 
+## Fase 4 — Multi-volume, slicing por eixo, visão 2D e fácies (em andamento)
+
+Decidido antes de começar: a visão 2D (equivalente ao `Slice2DDialog` do Andromeda) não é um
+sistema separado — é a **mesma** fatia (`SeismicSlice`), só vista por uma câmera diferente
+(ortográfica, sem rotação, sem luz) em vez da `OrbitCamera` 3D. Isso significa que trocar a
+posição do slider no 2D não re-sobe array nenhum: só reescreve o uniform `axis`/`index` de uma
+fatia que já está inteira na GPU — o que também acelera o 3D (mesma estrutura).
+
+- [x] `Renderer` deixou de ter um único `volume`/`colormap` implícito — agora guarda
+      `volumes: HashMap<id, VolumeEntry>` (textura + colormap + clim próprios) e
+      `slices: HashMap<id, SliceEntry>` (qual volume, qual eixo, qual posição, visível ou não).
+      Vários volumes e várias fatias do mesmo volume podem coexistir (ex: uma Inline e uma
+      Crossline do mesmo dataset, ao mesmo tempo) — mesmo modelo de dicionário por id que o
+      `VolumeSlicesManager`/`Well3DPlotManager` do Andromeda já usa.
+- [x] `add_volume(id, w, h, d, data)` / `remove_volume(id)` / `set_volume_colormap(id, rgba,
+      discrete)` / `set_volume_clim(id, min, max)` / `add_slice(slice_id, volume_id, axis,
+      index)` / `remove_slice` / `set_slice_visible` / `set_slice_axis_index` — substituem
+      `load_volume`/`set_colormap`/`set_clim` da Fase 3.
+- [x] Shader (`volume_slice.wgsl`) generalizado: eixo (0=Inline, 1=Crossline, 2=Time) e posição
+      normalizada agora vêm de um uniform por fatia (`@group(3)`, `SliceParams`), em vez do
+      `vec3<f32>(uv.x, 0.5, uv.y)` fixo da Fase 3.7 — a geometria do quad continua a mesma
+      (posicionamento espacial de verdade em coordenadas de survey fica pra Fase 5/6).
+- [x] Câmera ortográfica (`PanZoomCamera`, `nebula/src/camera.rs`) — só pan/zoom, sem rotação,
+      equivalente ao `PanZoomCamera` do VisPy. `CameraKind` (enum `Orbit`/`PanZoom`) escolhido
+      na criação do `Renderer` (`mode: "orbit"|"panzoom"`).
+- [x] Iluminação desligável: `SceneUniform.flags.x` (1.0 = aplica ambiente+difusa, 0.0 = não) —
+      a visão 2D é leitura de dado, não superfície *lit*; aplicar sombreamento nela escureceria
+      a seção sem motivo.
+- [x] Colormap **discreto** (fácies): `set_volume_colormap(..., discrete=True)` troca o sampler
+      da LUT de `Linear` pra `Nearest` — vira degrau em vez de gradiente entre classes. Sísmica
+      contínua não muda (`discrete=False`, já era o padrão da Fase 3.7).
+- [x] Colorbar funcional (`ColorbarWidget`, `python/embed_test.py`): gradiente + ticks
+      min/meio/max pintados em `QPainter` puro a partir do mesmo LUT `(N,4)` já usado pelo
+      Nebula — deliberadamente fora do wgpu (texto em GPU pediria um sistema de fonte/atlas
+      novo; mesma razão pela qual o label da cabeça do poço, na Fase 5, também vai ficar em Qt).
+- [x] `Slice2DDialog` (`python/embed_test.py`): diálogo 2D de verdade — segunda `NebulaWindow`
+      em modo `"panzoom"`, combobox de eixo, slider de posição, colorbar ao lado. Como cada
+      `Renderer` tem seu próprio `wgpu::Device`, o diálogo 2D sobe o mesmo array numpy que já
+      está em memória Python pro seu próprio `Renderer` — duplica um pouco de VRAM, mas evita a
+      complexidade de compartilhar device/texturas entre janelas (não vale a pena agora).
+- [x] **Ctrl+arrastar folheia a fatia**: em vez de só orbitar/pan, segurar Ctrl e arrastar (em
+      qualquer botão) muda a posição ao longo do eixo atual — vale nas duas visões (3D e 2D).
+      `NebulaWindow.on_axis_index_changed` notifica quem hospeda a janela (`Slice2DDialog`) pra
+      manter slider/combobox sincronizados mesmo quando a mudança vem do drag, não do widget.
+
+**Fora de escopo desta fase** (fica pra Fase 5, dependem dos dados de horizonte/poço existirem
+primeiro): ray marching/transfer functions pro volume 3D cheio (fácies/corpo geológico),
+horizonte como linha sobreposta na seção 2D, traço do poço sobreposto na seção 2D.
+
 ## Fases seguintes
 
-4. **Volume rendering**: ray marching no fragment/compute shader, transfer functions,
-   slicing de planos axis-aligned (equivalente ao `AxisAlignedImage` do VisPy)
 5. **Objetos sísmicos específicos** (ver seção "Cobertura funcional" abaixo): horizontes,
-   poços/logs, linhas arbitrárias, overlays HUD
+   poços/logs, linhas arbitrárias, overlays HUD; horizonte/poço sobrepostos na seção 2D
 6. **Performance**: LOD, streaming de volumes grandes, profiling
 
 ## Cobertura funcional — o que o Nebula precisa equivaler/superar em relação ao VisPy atual

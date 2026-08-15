@@ -22,20 +22,30 @@ import time
 import matplotlib
 import numpy as np
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QWindow
+from PyQt5.QtGui import QColor, QLinearGradient, QPainter, QWindow
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
     QComboBox,
+    QDialog,
     QDockWidget,
+    QHBoxLayout,
+    QLabel,
     QMainWindow,
+    QSlider,
     QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
+    QVBoxLayout,
     QWidget,
 )
 
 import nebula
+
+# Mesma convenção do AXIS_CONFIG do Slice2DDialog do Andromeda: 0=Inline,
+# 1=Crossline, 2=Time. O shader do Nebula usa esses mesmos índices.
+AXIS_NAMES = ["Inline", "Crossline", "Time"]
+AXIS_INDEX = {name: i for i, name in enumerate(AXIS_NAMES)}
 
 # Troque aqui pra testar outro colormap contínuo do matplotlib (ex: "jet",
 # "gray_r", "seismic", "gist_rainbow_r" — os mesmos nomes já usados hoje no
@@ -185,11 +195,17 @@ class NebulaWindow(QWindow):
     setSurfaceType(OpenGLSurface) impede o Qt de tentar pintar por cima com seu
     próprio backing store — quem desenha aqui dentro é o wgpu, via swapchain
     própria, sem passar pelo pipeline de pintura do Qt.
+
+    `mode="orbit"` é a visão 3D de sempre (Fase 2+); `mode="panzoom"` é a
+    visão 2D (Fase 4) — câmera ortográfica sem rotação, sem iluminação,
+    usada pelo `Slice2DDialog`. É a mesma classe pros dois casos: o volume
+    que ela mostra é sempre o objeto `Renderer.add_slice`/`add_volume` id=0.
     """
 
-    def __init__(self):
+    def __init__(self, mode: str = "orbit"):
         super().__init__()
         self.setSurfaceType(QWindow.OpenGLSurface)
+        self._mode = mode
         self._renderer = None
         self._closed = False
         self._drag_button = None
@@ -197,6 +213,12 @@ class NebulaWindow(QWindow):
         self._pending_volume = None
         self._pending_colormap = None
         self._pending_clim = None
+        self._slice_added = False
+        self._axis_index = (AXIS_INDEX["Crossline"], 0.5)
+        # Chamado (axis, index) sempre que a fatia muda, inclusive por
+        # Ctrl+arrastar — quem hospeda a janela (ex: Slice2DDialog) pode
+        # plugar aqui pra manter slider/combobox em sincronia.
+        self.on_axis_index_changed = None
 
     def set_volume(self, width: int, height: int, depth: int, data: np.ndarray):
         # O Renderer só existe depois do primeiro resize real (winId() só é
@@ -204,11 +226,19 @@ class NebulaWindow(QWindow):
         # o volume e mandamos pro Rust assim que o Renderer estiver pronto.
         self._pending_volume = (width, height, depth, data)
 
-    def set_colormap(self, rgba: np.ndarray):
-        self._pending_colormap = rgba
+    def set_colormap(self, rgba: np.ndarray, discrete: bool = False):
+        self._pending_colormap = (rgba, discrete)
 
     def set_clim(self, min_value: float, max_value: float):
         self._pending_clim = (min_value, max_value)
+
+    def set_axis_index(self, axis: int, index: float):
+        self._axis_index = (axis, index)
+        renderer = self._renderer
+        if renderer is not None and self._slice_added:
+            renderer.set_slice_axis_index(0, axis, index)
+        if self.on_axis_index_changed is not None:
+            self.on_axis_index_changed(axis, index)
 
     def shutdown(self):
         # Chamado antes do Qt começar a destruir a janela nativa: depois disso,
@@ -221,7 +251,7 @@ class NebulaWindow(QWindow):
             return None
         if self._renderer is None:
             hwnd = int(self.winId())
-            self._renderer = nebula.Renderer(hwnd, max(self.width(), 1), max(self.height(), 1))
+            self._renderer = nebula.Renderer(hwnd, max(self.width(), 1), max(self.height(), 1), self._mode)
         return self._renderer
 
     def resizeEvent(self, event):
@@ -237,16 +267,21 @@ class NebulaWindow(QWindow):
 
         if self._pending_volume is not None:
             width, height, depth, data = self._pending_volume
-            renderer.load_volume(width, height, depth, data)
+            renderer.add_volume(0, width, height, depth, data)
             self._pending_volume = None
 
         if self._pending_colormap is not None:
-            renderer.set_colormap(self._pending_colormap)
+            rgba, discrete = self._pending_colormap
+            renderer.set_volume_colormap(0, rgba, discrete)
             self._pending_colormap = None
 
         if self._pending_clim is not None:
-            renderer.set_clim(*self._pending_clim)
+            renderer.set_volume_clim(0, *self._pending_clim)
             self._pending_clim = None
+
+        if not self._slice_added:
+            renderer.add_slice(0, 0, *self._axis_index)
+            self._slice_added = True
 
         renderer.render()
 
@@ -270,6 +305,23 @@ class NebulaWindow(QWindow):
         dy = float(pos.y() - self._last_pos.y())
         self._last_pos = pos
 
+        if event.modifiers() & Qt.ControlModifier:
+            # Ctrl+arrastar (em qualquer botão) "folheia" a fatia — muda a
+            # posição ao longo do eixo atual em vez de mexer na câmera. Vale
+            # tanto na visão 3D orbital quanto na 2D pan/zoom.
+            axis, index = self._axis_index
+            index = min(1.0, max(0.0, index + dy * 0.002))
+            self.set_axis_index(axis, index)
+            return
+
+        if self._mode == "panzoom":
+            # 2D não tem orbit — botão esquerdo também vira pan.
+            if self._drag_button in (Qt.LeftButton, Qt.MiddleButton):
+                renderer.pan(dx, dy)
+            elif self._drag_button == Qt.RightButton:
+                renderer.zoom(dy)
+            return
+
         if self._drag_button == Qt.LeftButton:
             renderer.orbit(dx, dy)
         elif self._drag_button == Qt.MiddleButton:
@@ -281,6 +333,134 @@ class NebulaWindow(QWindow):
         renderer = self._ensure_renderer()
         if renderer is not None:
             renderer.zoom(event.angleDelta().y() / 8.0)
+
+
+class ColorbarWidget(QWidget):
+    """Colorbar funcional (Fase 4): gradiente + ticks min/meio/max, pintados
+    em Qt puro (QPainter) a partir do mesmo LUT `(N,4)` uint8 já usado pelo
+    Nebula (`build_colormap_lut`) e do `clim` atual. Deliberadamente fora do
+    wgpu — texto em GPU exigiria um sistema de fonte/atlas novo (mesma razão
+    pela qual o label da cabeça do poço, na Fase 5, também vai ficar em Qt).
+    """
+
+    def __init__(self, lut: np.ndarray, clim: tuple, parent=None):
+        super().__init__(parent)
+        self._lut = lut
+        self._clim = clim
+        self.setMinimumWidth(90)
+
+    def set_lut(self, lut: np.ndarray):
+        self._lut = lut
+        self.update()
+
+    def set_clim(self, clim: tuple):
+        self._clim = clim
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        rect = self.rect()
+        bar_width = 24
+        margin = 10
+        bar_rect = rect.adjusted(margin, margin, -(rect.width() - bar_width - margin), -margin)
+
+        n = len(self._lut)
+        gradient = QLinearGradient(0, bar_rect.top(), 0, bar_rect.bottom())
+        step = max(1, n // 32)
+        for i in range(0, n, step):
+            # Topo da barra = valor máximo do clim (convenção usual de colorbar vertical).
+            t = 1.0 - i / max(n - 1, 1)
+            r, g, b, a = (int(c) for c in self._lut[i])
+            gradient.setColorAt(t, QColor(r, g, b, a))
+
+        painter.fillRect(bar_rect, gradient)
+        painter.setPen(QColor(180, 180, 180))
+        painter.drawRect(bar_rect)
+
+        vmin, vmax = self._clim
+        painter.setPen(QColor(220, 220, 220))
+        for value, y in (
+            (vmax, bar_rect.top()),
+            ((vmin + vmax) * 0.5, bar_rect.center().y()),
+            (vmin, bar_rect.bottom()),
+        ):
+            painter.drawText(bar_rect.right() + 6, y + 4, f"{value:.2f}")
+
+
+class Slice2DDialog(QDialog):
+    """Visão 2D de uma fatia (Fase 4) — equivalente ao `Slice2DDialog` do
+    Andromeda, mas rodando no Nebula: câmera ortográfica sem luz
+    (`NebulaWindow(mode="panzoom")`), colorbar funcional ao lado, seletor de
+    eixo (Inline/Crossline/Time) e slider de posição. Sobrepor horizonte/poço
+    na seção fica pra Fase 5, já que depende dos dados desses objetos
+    existirem no Nebula primeiro.
+    """
+
+    def __init__(self, parent, volume_dim: int, volume_data: np.ndarray, colormap_lut: np.ndarray, clim: tuple):
+        super().__init__(parent)
+        self.setWindowTitle("Nebula - Seção 2D")
+        self.resize(720, 620)
+
+        self._render_window = NebulaWindow(mode="panzoom")
+        container = QWidget.createWindowContainer(self._render_window, self)
+
+        self._axis_combo = QComboBox()
+        self._axis_combo.addItems(AXIS_NAMES)
+        self._axis_combo.setCurrentText("Crossline")
+
+        self._position_slider = QSlider(Qt.Horizontal)
+        self._position_slider.setMinimum(0)
+        self._position_slider.setMaximum(1000)
+        self._position_slider.setValue(500)
+
+        self._colorbar = ColorbarWidget(colormap_lut, clim)
+
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(QLabel("Eixo:"))
+        top_bar.addWidget(self._axis_combo)
+        top_bar.addWidget(QLabel("Posição:"))
+        top_bar.addWidget(self._position_slider, stretch=1)
+
+        canvas_row = QHBoxLayout()
+        canvas_row.addWidget(container, stretch=1)
+        canvas_row.addWidget(self._colorbar)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(top_bar)
+        layout.addLayout(canvas_row, stretch=1)
+
+        self._render_window.set_volume(volume_dim, volume_dim, volume_dim, volume_data)
+        self._render_window.set_colormap(colormap_lut)
+        self._render_window.set_clim(*clim)
+        self._render_window.set_axis_index(AXIS_INDEX["Crossline"], 0.5)
+
+        self._axis_combo.currentTextChanged.connect(self._on_axis_or_position_changed)
+        self._position_slider.valueChanged.connect(self._on_axis_or_position_changed)
+        # Ctrl+arrastar dentro do canvas muda a fatia sem passar pelo slider —
+        # mantém o slider/combobox mostrando a posição de verdade mesmo assim.
+        self._render_window.on_axis_index_changed = self._on_render_axis_index_changed
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._render_window.render_frame)
+        self._timer.start(16)
+
+    def _on_axis_or_position_changed(self, *_args):
+        axis = AXIS_INDEX[self._axis_combo.currentText()]
+        index = self._position_slider.value() / self._position_slider.maximum()
+        self._render_window.set_axis_index(axis, index)
+
+    def _on_render_axis_index_changed(self, axis: int, index: float):
+        self._axis_combo.blockSignals(True)
+        self._axis_combo.setCurrentText(AXIS_NAMES[axis])
+        self._axis_combo.blockSignals(False)
+        self._position_slider.blockSignals(True)
+        self._position_slider.setValue(int(round(index * self._position_slider.maximum())))
+        self._position_slider.blockSignals(False)
+
+    def closeEvent(self, event):
+        self._timer.stop()
+        self._render_window.shutdown()
+        super().closeEvent(event)
 
 
 def build_object_tree() -> QTreeWidget:
@@ -311,13 +491,18 @@ def build_object_tree() -> QTreeWidget:
     return tree
 
 
-def build_slices_toolbar(main_win: QMainWindow) -> QToolBar:
+def build_slices_toolbar(main_win: QMainWindow, render_window: "NebulaWindow", open_2d_callback) -> QToolBar:
     """Réplica simplificada da slicesToolBar do Andromeda (seletor de eixo +
-    combobox de exagero vertical)."""
+    combobox de exagero vertical), agora ligada de verdade ao Nebula
+    (Fase 4): trocar o eixo aqui muda a fatia 3D ao vivo."""
     toolbar = QToolBar("Slices", main_win)
 
     axis_combo = QComboBox()
-    axis_combo.addItems(["Inline", "Crossline", "Time"])
+    axis_combo.addItems(AXIS_NAMES)
+    axis_combo.setCurrentText("Crossline")
+    axis_combo.currentTextChanged.connect(
+        lambda name: render_window.set_axis_index(AXIS_INDEX[name], 0.5)
+    )
     toolbar.addWidget(axis_combo)
 
     toolbar.addSeparator()
@@ -329,6 +514,11 @@ def build_slices_toolbar(main_win: QMainWindow) -> QToolBar:
 
     toolbar.addSeparator()
     toolbar.addAction(QAction("Reset View", main_win))
+
+    toolbar.addSeparator()
+    view_2d_action = QAction("Ver em 2D", main_win)
+    view_2d_action.triggered.connect(open_2d_callback)
+    toolbar.addAction(view_2d_action)
 
     return toolbar
 
@@ -348,16 +538,27 @@ def main():
 
     volume_dim = 64
     volume_data = build_synthetic_volume(volume_dim, volume_dim, volume_dim, pattern=VOLUME_PATTERN)
-    render_window.set_volume(volume_dim, volume_dim, volume_dim, volume_data)
+    colormap_lut = build_colormap_lut(COLORMAP_NAME)
+    clim = (0.0, 1.0)  # bate com a faixa de valores do volume sintético
 
-    render_window.set_colormap(build_colormap_lut(COLORMAP_NAME))
-    render_window.set_clim(0.0, 1.0)  # bate com a faixa de valores do volume sintético
+    render_window.set_volume(volume_dim, volume_dim, volume_dim, volume_data)
+    render_window.set_colormap(colormap_lut)
+    render_window.set_clim(*clim)
 
     tree_dock = QDockWidget("Object Tree", main_win)
     tree_dock.setWidget(build_object_tree())
     main_win.addDockWidget(Qt.LeftDockWidgetArea, tree_dock)
 
-    main_win.addToolBar(Qt.TopToolBarArea, build_slices_toolbar(main_win))
+    dialog_2d = {"instance": None}
+
+    def open_2d_dialog():
+        if dialog_2d["instance"] is None:
+            dialog_2d["instance"] = Slice2DDialog(main_win, volume_dim, volume_data, colormap_lut, clim)
+        dialog_2d["instance"].show()
+        dialog_2d["instance"].raise_()
+        dialog_2d["instance"].activateWindow()
+
+    main_win.addToolBar(Qt.TopToolBarArea, build_slices_toolbar(main_win, render_window, open_2d_dialog))
 
     status_bar = main_win.statusBar()
     fps_state = {"last_time": time.perf_counter(), "frames": 0}

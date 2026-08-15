@@ -3,6 +3,7 @@ mod colormap;
 mod geometry;
 mod volume;
 
+use std::collections::HashMap;
 use std::num::NonZeroIsize;
 
 use bytemuck::{Pod, Zeroable};
@@ -12,12 +13,18 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, Win32WindowHandle, WindowsDisplayHandle};
 
-use camera::OrbitCamera;
+use camera::{CameraKind, OrbitCamera, PanZoomCamera};
 use colormap::Colormap;
 use geometry::{SliceVertex, SLICE_INDICES, SLICE_VERTICES};
 use volume::Volume3D;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+// Amplitude sísmica amostrada não deveria ser interpolada silenciosamente
+// entre vizinhos, e sampling linear de R32Float depende da feature
+// FLOAT32_FILTERABLE (nem todo adapter tem) — nearest evita as duas questões
+// de uma vez. Vale pra todo volume, não é uma escolha por instância.
+const VOLUME_FILTERABLE: bool = false;
 
 /// Tudo que os shaders precisam saber sobre a cena por frame: câmera (pra
 /// projetar vértices) e luz (pra shading). Um bind group só em vez de dois,
@@ -30,6 +37,39 @@ struct SceneUniform {
     // xyz usados; w é só padding pra alinhamento de 16 bytes em uniform buffers.
     light_position: [f32; 4],
     camera_position: [f32; 4],
+    // x = 1.0 aplica iluminação (visão 3D orbital), 0.0 não aplica (visão 2D
+    // pan/zoom — seção é dado cru, não superfície lit).
+    flags: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct SliceParamsUniform {
+    axis: u32,
+    index: f32,
+    _pad: [f32; 2],
+}
+
+/// Um volume carregado na GPU (textura 3D) junto com o colormap/clim usados
+/// pra colori-lo. Um `Renderer` pode ter vários, cada um com seu próprio id
+/// escolhido pelo lado Python (mesmo id que o Andromeda já usa pro dataset).
+struct VolumeEntry {
+    volume: Volume3D,
+    colormap: Colormap,
+    clim: (f32, f32),
+}
+
+/// Uma fatia (AxisAlignedImage) de um volume específico: qual eixo (Inline/
+/// Crossline/Time) e em que posição normalizada. Vários slices podem apontar
+/// pro mesmo volume (ex: uma seção Inline e uma Crossline do mesmo dataset,
+/// visíveis ao mesmo tempo).
+struct SliceEntry {
+    volume_id: u64,
+    axis: u32,
+    index: f32,
+    visible: bool,
+    params_buffer: wgpu::Buffer,
+    params_bind_group: wgpu::BindGroup,
 }
 
 fn create_depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
@@ -63,7 +103,7 @@ struct Renderer {
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
 
-    camera: OrbitCamera,
+    camera: CameraKind,
     scene_buffer: wgpu::Buffer,
     scene_bind_group: wgpu::BindGroup,
 
@@ -73,18 +113,17 @@ struct Renderer {
     num_slice_indices: u32,
 
     volume_bind_group_layout: wgpu::BindGroupLayout,
-    volume_filterable: bool,
-    volume: Option<Volume3D>,
-
     colormap_bind_group_layout: wgpu::BindGroupLayout,
-    colormap: Colormap,
-    clim: (f32, f32),
+    slice_params_bind_group_layout: wgpu::BindGroupLayout,
+
+    volumes: HashMap<u64, VolumeEntry>,
+    slices: HashMap<u64, SliceEntry>,
 }
 
 #[pymethods]
 impl Renderer {
     #[new]
-    fn new(hwnd: isize, width: u32, height: u32) -> PyResult<Self> {
+    fn new(hwnd: isize, width: u32, height: u32, mode: String) -> PyResult<Self> {
         let hwnd = NonZeroIsize::new(hwnd)
             .ok_or_else(|| PyRuntimeError::new_err("hwnd não pode ser zero"))?;
 
@@ -114,12 +153,6 @@ impl Renderer {
         }))
         .map_err(|e| PyRuntimeError::new_err(format!("nenhum adapter wgpu disponível: {e}")))?;
 
-        // Sampling da textura de volume é sempre "nearest": amplitude sísmica
-        // amostrada não deveria ser interpolada silenciosamente entre vizinhos,
-        // e sampling linear de R32Float depende da feature FLOAT32_FILTERABLE
-        // (nem todo adapter tem) — nearest evita as duas questões de uma vez.
-        let volume_filterable = false;
-
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: None,
             required_features: wgpu::Features::empty(),
@@ -146,7 +179,11 @@ impl Renderer {
 
         let depth_view = create_depth_view(&device, &config);
 
-        let camera = OrbitCamera::new(config.width as f32 / config.height as f32);
+        let aspect = config.width as f32 / config.height as f32;
+        let camera = match mode.as_str() {
+            "panzoom" | "2d" => CameraKind::PanZoom(PanZoomCamera::new(aspect)),
+            _ => CameraKind::Orbit(OrbitCamera::new(aspect)),
+        };
 
         let scene_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -172,6 +209,7 @@ impl Renderer {
             // iluminado, não importa de que ângulo — é assim que o Petrel faz.
             light_position: [initial_eye.x, initial_eye.y, initial_eye.z, 0.0],
             camera_position: [initial_eye.x, initial_eye.y, initial_eye.z, 0.0],
+            flags: [camera.lighting_enabled(), 0.0, 0.0, 0.0],
         };
 
         let scene_buffer = wgpu::util::DeviceExt::create_buffer_init(
@@ -201,7 +239,7 @@ impl Renderer {
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float {
-                                filterable: volume_filterable,
+                                filterable: VOLUME_FILTERABLE,
                             },
                             view_dimension: wgpu::TextureViewDimension::D3,
                             multisampled: false,
@@ -211,7 +249,7 @@ impl Renderer {
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(if volume_filterable {
+                        ty: wgpu::BindingType::Sampler(if VOLUME_FILTERABLE {
                             wgpu::SamplerBindingType::Filtering
                         } else {
                             wgpu::SamplerBindingType::NonFiltering
@@ -254,17 +292,20 @@ impl Renderer {
                 ],
             });
 
-        // Cinza simples até o Python chamar `set_colormap` com uma paleta de
-        // verdade — evita o Renderer ficar num estado "sem colormap" que
-        // precisaria de tratamento especial no render().
-        let clim = (0.0_f32, 1.0_f32);
-        let colormap = Colormap::upload(
-            &device,
-            &queue,
-            &colormap_bind_group_layout,
-            &[0, 0, 0, 255, 255, 255, 255, 255],
-            clim,
-        );
+        let slice_params_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("slice_params_bind_group_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
 
         let slice_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("volume_slice_shader"),
@@ -277,6 +318,7 @@ impl Renderer {
                 Some(&scene_bind_group_layout),
                 Some(&volume_bind_group_layout),
                 Some(&colormap_bind_group_layout),
+                Some(&slice_params_bind_group_layout),
             ],
             immediate_size: 0,
         });
@@ -345,11 +387,10 @@ impl Renderer {
             slice_index_buffer,
             num_slice_indices: SLICE_INDICES.len() as u32,
             volume_bind_group_layout,
-            volume_filterable,
-            volume: None,
             colormap_bind_group_layout,
-            colormap,
-            clim,
+            slice_params_bind_group_layout,
+            volumes: HashMap::new(),
+            slices: HashMap::new(),
         })
     }
 
@@ -380,11 +421,22 @@ impl Renderer {
         self.camera.zoom(delta);
     }
 
-    /// Envia um volume escalar (ex: amplitude sísmica) pra GPU como textura 3D.
-    /// `data` precisa suportar o protocolo de buffer do Python (ex: um array
-    /// numpy `float32` C-contíguo) com exatamente `width * height * depth`
-    /// elementos, na ordem (inline, xline, amostra).
-    fn load_volume(&mut self, width: u32, height: u32, depth: u32, data: PyBuffer<f32>) -> PyResult<()> {
+    /// Envia um volume escalar (ex: amplitude sísmica, ou classes de fácies)
+    /// pra GPU como textura 3D, sob o id escolhido pelo lado Python (o mesmo
+    /// id que o Andromeda já usa pro dataset). `data` precisa suportar o
+    /// protocolo de buffer do Python (ex: um array numpy `float32`
+    /// C-contíguo) com exatamente `width * height * depth` elementos, na
+    /// ordem (inline, xline, amostra). Recém-criado, o volume usa um
+    /// colormap cinza neutro até `set_volume_colormap` ser chamado — assim
+    /// nunca existe um estado "volume sem colormap" pra tratar à parte.
+    fn add_volume(
+        &mut self,
+        id: u64,
+        width: u32,
+        height: u32,
+        depth: u32,
+        data: PyBuffer<f32>,
+    ) -> PyResult<()> {
         let expected = (width as usize) * (height as usize) * (depth as usize);
         if data.item_count() != expected {
             return Err(PyRuntimeError::new_err(format!(
@@ -396,50 +448,149 @@ impl Renderer {
         let values = Python::attach(|py| data.to_vec(py))
             .map_err(|e| PyRuntimeError::new_err(format!("falha ao ler o buffer: {e}")))?;
 
-        self.volume = Some(Volume3D::upload(
+        let volume = Volume3D::upload(
             &self.device,
             &self.queue,
             &self.volume_bind_group_layout,
             (width, height, depth),
-            self.volume_filterable,
+            VOLUME_FILTERABLE,
             &values,
-        ));
+        );
 
+        let clim = (0.0_f32, 1.0_f32);
+        let colormap = Colormap::upload(
+            &self.device,
+            &self.queue,
+            &self.colormap_bind_group_layout,
+            &[0, 0, 0, 255, 255, 255, 255, 255],
+            clim,
+            false,
+        );
+
+        self.volumes.insert(id, VolumeEntry { volume, colormap, clim });
         Ok(())
     }
 
-    /// Define a paleta de cores (colormap contínuo) usada pra mapear o valor
-    /// amostrado do volume em cor. `rgba` precisa ser um array `uint8`
-    /// C-contíguo de shape `(N, 4)` — a origem (matplotlib, ou Petrel/Paradigm
-    /// convertidos pra VisPy no Andromeda) não importa pro Nebula: o lado
-    /// Python já resolve isso e manda a paleta pronta, amostrada em N pontos.
-    fn set_colormap(&mut self, rgba: PyBuffer<u8>) -> PyResult<()> {
+    /// Remove um volume e qualquer fatia que ainda apontasse pra ele.
+    fn remove_volume(&mut self, id: u64) {
+        self.volumes.remove(&id);
+        self.slices.retain(|_, slice| slice.volume_id != id);
+    }
+
+    /// Define a paleta de cores usada pra mapear o valor amostrado do volume
+    /// `id` em cor. `rgba` precisa ser um array `uint8` C-contíguo de shape
+    /// `(N, 4)` — a origem (matplotlib, ou Petrel/Paradigm convertidos pra
+    /// VisPy no Andromeda) não importa pro Nebula: o lado Python já resolve
+    /// isso e manda a paleta pronta, amostrada em N pontos. `discrete=true`
+    /// pra fácies (classes categóricas, sem interpolar entre cores vizinhas);
+    /// `discrete=false` pra sísmica/atributos contínuos.
+    fn set_volume_colormap(&mut self, id: u64, rgba: PyBuffer<u8>, discrete: bool) -> PyResult<()> {
         if rgba.item_count() % 4 != 0 {
             return Err(PyRuntimeError::new_err(
                 "rgba precisa ter um múltiplo de 4 elementos (N cores RGBA)",
             ));
         }
+        let entry = self
+            .volumes
+            .get_mut(&id)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("volume {id} não encontrado")))?;
 
         let bytes = Python::attach(|py| rgba.to_vec(py))
             .map_err(|e| PyRuntimeError::new_err(format!("falha ao ler o buffer: {e}")))?;
 
-        self.colormap = Colormap::upload(
+        entry.colormap = Colormap::upload(
             &self.device,
             &self.queue,
             &self.colormap_bind_group_layout,
             &bytes,
-            self.clim,
+            entry.clim,
+            discrete,
         );
 
         Ok(())
     }
 
-    /// Ajusta a faixa de valores (`clim`) mapeada pros extremos do colormap —
-    /// equivalente ao `clim=(min, max)` do Andromeda. Não recria a textura do
-    /// colormap, só reescreve o uniform.
-    fn set_clim(&mut self, min: f32, max: f32) {
-        self.clim = (min, max);
-        self.colormap.set_clim(&self.queue, self.clim);
+    /// Ajusta a faixa de valores (`clim`) do volume `id`, mapeada pros
+    /// extremos do colormap — equivalente ao `clim=(min, max)` do Andromeda.
+    /// Não recria a textura do colormap, só reescreve o uniform.
+    fn set_volume_clim(&mut self, id: u64, min: f32, max: f32) -> PyResult<()> {
+        let entry = self
+            .volumes
+            .get_mut(&id)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("volume {id} não encontrado")))?;
+        entry.clim = (min, max);
+        entry.colormap.set_clim(&self.queue, entry.clim);
+        Ok(())
+    }
+
+    /// Adiciona uma fatia (equivalente ao `AxisAlignedImage` do VisPy) do
+    /// volume `volume_id`, sob o id `slice_id` escolhido pelo lado Python.
+    /// `axis`: 0 = Inline, 1 = Crossline, 2 = Time (mesma convenção do
+    /// `AXIS_CONFIG` do diálogo 2D do Andromeda). `index` é a posição
+    /// normalizada (0..1) ao longo desse eixo. Vários slices podem apontar
+    /// pro mesmo volume ao mesmo tempo (ex: uma Inline e uma Crossline
+    /// visíveis juntas).
+    fn add_slice(&mut self, slice_id: u64, volume_id: u64, axis: u32, index: f32) -> PyResult<()> {
+        if !self.volumes.contains_key(&volume_id) {
+            return Err(PyRuntimeError::new_err(format!(
+                "volume {volume_id} não encontrado"
+            )));
+        }
+
+        let params_buffer = wgpu::util::DeviceExt::create_buffer_init(
+            &self.device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("slice_params_buffer"),
+                contents: bytemuck::cast_slice(&[SliceParamsUniform { axis, index, _pad: [0.0; 2] }]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            },
+        );
+        let params_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("slice_params_bind_group"),
+            layout: &self.slice_params_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params_buffer.as_entire_binding(),
+            }],
+        });
+
+        self.slices.insert(
+            slice_id,
+            SliceEntry { volume_id, axis, index, visible: true, params_buffer, params_bind_group },
+        );
+        Ok(())
+    }
+
+    fn remove_slice(&mut self, slice_id: u64) {
+        self.slices.remove(&slice_id);
+    }
+
+    fn set_slice_visible(&mut self, slice_id: u64, visible: bool) -> PyResult<()> {
+        let slice = self
+            .slices
+            .get_mut(&slice_id)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("slice {slice_id} não encontrada")))?;
+        slice.visible = visible;
+        Ok(())
+    }
+
+    /// Muda o eixo (0=Inline, 1=Crossline, 2=Time) e/ou a posição (0..1) de
+    /// uma fatia já existente — é o que o slider/combobox de eixo do
+    /// Andromeda vai chamar a cada movimento, sem recriar nada na GPU além
+    /// de reescrever um uniform pequeno.
+    fn set_slice_axis_index(&mut self, slice_id: u64, axis: u32, index: f32) -> PyResult<()> {
+        let slice = self
+            .slices
+            .get_mut(&slice_id)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("slice {slice_id} não encontrada")))?;
+        slice.axis = axis;
+        slice.index = index;
+        self.queue.write_buffer(
+            &slice.params_buffer,
+            0,
+            bytemuck::cast_slice(&[SliceParamsUniform { axis, index, _pad: [0.0; 2] }]),
+        );
+        Ok(())
     }
 
     fn render(&mut self) -> PyResult<()> {
@@ -470,6 +621,7 @@ impl Renderer {
             model: Mat4::IDENTITY.to_cols_array_2d(),
             light_position: [eye.x, eye.y, eye.z, 0.0],
             camera_position: [eye.x, eye.y, eye.z, 0.0],
+            flags: [self.camera.lighting_enabled(), 0.0, 0.0, 0.0],
         };
 
         self.queue
@@ -515,16 +667,23 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            // Enquanto nenhum volume foi carregado (load_volume ainda não chamado),
-            // só limpamos a tela — não há bind group de textura pra desenhar.
-            if let Some(volume) = &self.volume {
-                render_pass.set_pipeline(&self.slice_pipeline);
-                render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
-                render_pass.set_bind_group(1, &volume.bind_group, &[]);
-                render_pass.set_bind_group(2, &self.colormap.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, self.slice_vertex_buffer.slice(..));
-                render_pass
-                    .set_index_buffer(self.slice_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            // Enquanto nenhuma fatia foi adicionada (add_slice ainda não
+            // chamado), só limpamos a tela.
+            render_pass.set_pipeline(&self.slice_pipeline);
+            render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.slice_vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.slice_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+
+            for slice in self.slices.values() {
+                if !slice.visible {
+                    continue;
+                }
+                let Some(volume) = self.volumes.get(&slice.volume_id) else {
+                    continue;
+                };
+                render_pass.set_bind_group(1, &volume.volume.bind_group, &[]);
+                render_pass.set_bind_group(2, &volume.colormap.bind_group, &[]);
+                render_pass.set_bind_group(3, &slice.params_bind_group, &[]);
                 render_pass.draw_indexed(0..self.num_slice_indices, 0, 0..1);
             }
         }

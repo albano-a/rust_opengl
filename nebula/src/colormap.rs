@@ -18,6 +18,7 @@ impl Colormap {
         bind_group_layout: &wgpu::BindGroupLayout,
         rgba: &[u8],
         clim: (f32, f32),
+        discrete: bool,
     ) -> Self {
         assert_eq!(rgba.len() % 4, 0, "RGBA precisa ser múltiplo de 4 bytes");
         let resolution = (rgba.len() / 4) as u32;
@@ -60,15 +61,18 @@ impl Colormap {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Rgba8Unorm é filtrável em qualquer hardware, sem a dor de cabeça do
-        // FLOAT32_FILTERABLE que tivemos com a textura de volume (Fase 3) —
-        // faz sentido usar Linear aqui: colormap contínuo deve interpolar.
+        // FLOAT32_FILTERABLE que tivemos com a textura de volume (Fase 3).
+        // Colormap contínuo (sísmica) interpola (Linear); colormap discreto
+        // (fácies — classes são categorias, não devem se misturar na borda)
+        // usa Nearest, virando degrau em vez de gradiente.
+        let filter = if discrete { wgpu::FilterMode::Nearest } else { wgpu::FilterMode::Linear };
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("colormap_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: filter,
+            min_filter: filter,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
